@@ -1,0 +1,1 @@
+#Soll die Holdings in die DB laden

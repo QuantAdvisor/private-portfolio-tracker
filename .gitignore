@@ -1,0 +1,29 @@
+# Secrets – niemals in Git
+.env
+
+# Generierte Reports (groß, kein Versionierungsbedarf)
+reports/
+
+# Log-Dateien
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# ETF-Holdings-Dateien (proprietäre Emittenten-Exporte, kein Repo-Inhalt)
+ETF Holdings/
+
+# Editor / OS
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp

@@ -1,0 +1,23 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//c/Users/Chris/OneDrive/Quant_Advisor/Python Dashboards/portfolio-tracker/**)",
+      "Read(//c/Users/Chris/OneDrive/Quant_Advisor/Python Dashboards/trading-dashboard/**)",
+      "Bash(pip install *)",
+      "Bash(python -c ' *)",
+      "Bash(python -c \"import sys; print\\(sys.executable\\)\")",
+      "Bash(C:\\\\Users\\\\Chris\\\\AppData\\\\Local\\\\Python\\\\pythoncore-3.14-64\\\\python.exe -m pip install openpyxl pandas --quiet)",
+      "PowerShell(python -c \"import sys; print\\(sys.executable\\)\")",
+      "PowerShell(python -m pip install openpyxl pandas --quiet 2>&1)",
+      "PowerShell(python -m pip install chardet --quiet 2>&1)",
+      "Read(//c/Users/Chris/.claude/projects/c--Users-Chris-OneDrive-Quant_Advisor-Python-Dashboards-private-portfolio-tracker/memory/**)",
+      "Bash(ls \"C:\\\\Users\\\\Chris\\\\OneDrive\\\\Quant_Advisor\\\\Aufbau der Datenbank\\\\Ticker Upload\")",
+      "Read(//c/Users/Chris/OneDrive/Quant_Advisor/Aufbau der Datenbank/Ticker Upload/**)",
+      "Read(//c/Users/Chris/OneDrive/Quant_Advisor/Aufbau der Datenbank/Aufbau der Tabellen/**)",
+      "Read(//c/Users/Chris/OneDrive/Quant_Advisor/Aufbau der Datenbank/Datenabruf und Laden in DB/**)"
+    ],
+    "additionalDirectories": [
+      "C:\\Users\\Chris\\.claude\\projects\\c--Users-Chris-OneDrive-Quant_Advisor-Python-Dashboards-private-portfolio-tracker\\memory"
+    ]
+  }
+}
