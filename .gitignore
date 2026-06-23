@@ -21,6 +21,9 @@ venv/
 # ETF-Holdings-Dateien (proprietäre Emittenten-Exporte, kein Repo-Inhalt)
 ETF Holdings/
 
+# Depot-Export und persönliche Finanzdaten
+ETF Portfolio/
+
 # Editor / OS
 .DS_Store
 Thumbs.db
