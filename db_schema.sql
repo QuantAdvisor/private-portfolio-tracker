@@ -173,6 +173,7 @@ INSERT INTO portfolio.etf (isin, name, ticker, currency, emittent, index_name) V
     ('IE00B53QG562', 'iShares Core MSCI Europe UCITS ETF (Acc)',                     'CEMR', 'EUR', 'iShares',     'MSCI Europe'),
     ('IE00B4L5YC18', 'iShares Core MSCI Emerging Markets IMI UCITS ETF (Acc)',       'IS3N', 'USD', 'iShares',     'MSCI Emerging Markets IMI'),
     ('IE00BKX55T58', 'Vanguard FTSE Developed World UCITS ETF (Dist)',               'VWCE', 'USD', 'Vanguard',    'FTSE Developed World'),
+    ('IE000OEF25S1', 'Invesco MSCI World Equal Weight UCITS ETF (Acc)',              'MWEQ', 'USD', 'Invesco',     'MSCI World Equal Weighted'),
     -- Christian Riester
     ('IE00BL25JN58', 'Xtrackers MSCI World Minimum Volatility UCITS ETF 1C',        'XDEB', 'EUR', 'Xtrackers',   'MSCI World Minimum Volatility'),
     ('IE00B8KGV557', 'iShares Edge MSCI EM Minimum Volatility UCITS ETF (Acc)',      'EUNZ', 'USD', 'iShares',     'MSCI Emerging Markets Minimum Volatility'),
@@ -226,9 +227,15 @@ CREATE INDEX IF NOT EXISTS ix_benchmark_price_date
     ON portfolio.benchmark_price (ticker, price_date DESC);
 
 INSERT INTO portfolio.benchmark (ticker, name, yf_symbol, currency) VALUES
-    ('MSCI_WORLD',    'iShares Core MSCI World (EXS1.DE)',       'EXS1.DE',  'EUR'),
-    ('NASDAQ_100',    'iShares Core NASDAQ 100 (CSNDX.DE)',      'CSNDX.DE', 'EUR'),
-    ('EURO_STOXX_50', 'iShares Core Euro STOXX 50 (EXW1.DE)',    'EXW1.DE',  'EUR'),
-    ('STOXX_EU_600',  'iShares STOXX Europe 600 (EXSA.DE)',      'EXSA.DE',  'EUR'),
-    ('MSCI_ACWI',     'iShares MSCI ACWI UCITS ETF (IUSQ.DE)',   'IUSQ.DE',  'EUR')
+    ('MSCI_WORLD',       'iShares Core MSCI World UCITS ETF Acc (EUNL.DE)',                       'EUNL.DE',  'EUR'),
+    ('NASDAQ_100',       'iShares Core NASDAQ 100 (CSNDX.DE)',                                    'CSNDX.DE', 'EUR'),
+    ('EURO_STOXX_50',    'iShares Core Euro STOXX 50 (EXW1.DE)',                                  'EXW1.DE',  'EUR'),
+    ('STOXX_EU_600',     'iShares STOXX Europe 600 (EXSA.DE)',                                    'EXSA.DE',  'EUR'),
+    ('MSCI_ACWI',        'iShares MSCI ACWI UCITS ETF (IUSQ.DE)',                                 'IUSQ.DE',  'EUR'),
+    ('GLOBAL_AGG_BOND_H','iShares Core Global Aggregate Bond UCITS ETF EUR Hedged Acc (EUNA.DE)', 'EUNA.DE',  'EUR')
 ON CONFLICT (ticker) DO NOTHING;
+-- Hinweis: NASDAQ_100 yf_symbol wurde nachtraeglich auf 'CNDX.AS' korrigiert (CSNDX.DE delisted,
+-- siehe Server-Deployment-Log), CSNDX.DE hier nur als urspruengliche Seed-Referenz belassen.
+-- MSCI_WORLD 2026-08-08 von EXS1.DE (Dist) auf EUNL.DE (Acc, WKN A0RPWH) umgestellt (User-Wunsch).
+-- GLOBAL_AGG_BOND_H 2026-08-08 neu: Komponente der 60/40-Misch-Benchmark in generate_report.py
+-- (wird dort zur Laufzeit mit MSCI_WORLD verkettet, kein eigener "MIX"-Tabelleneintrag).

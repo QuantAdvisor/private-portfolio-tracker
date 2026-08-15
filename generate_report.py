@@ -53,8 +53,16 @@ ORANGE   = "#EA580C"
 PALETTE  = ["#2563EB","#16A34A","#EA580C","#7C3AED","#0891B2",
             "#CA8A04","#DB2777","#65A30D","#0D9488","#9333EA"]
 
-BENCHMARK_TICKER = "MSCI_WORLD"   # Key in portfolio.benchmark
-BENCHMARK_NAME   = "iShares MSCI World (EXS1)"
+BENCHMARK_PRIMARY = {
+    "ticker": "MSCI_WORLD",   # Key in portfolio.benchmark
+    "name":   "iShares Core MSCI World UCITS ETF Acc (EUNL)",
+}
+# Gemischte Benchmark: zur Laufzeit aus den Einzel-Tickern verkettet (kein eigener
+# DB-Eintrag noetig, bleibt automatisch aktuell sobald die Komponenten neue Kurse haben).
+BENCHMARK_SECONDARY = {
+    "name": "60/40 MSCI World / Global Agg Bond (EUR H)",
+    "weights": {"MSCI_WORLD": 0.6, "GLOBAL_AGG_BOND_H": 0.4},
+}
 
 
 # ── Hilfsfunktionen ───────────────────────────────────────────────────────────
@@ -418,7 +426,100 @@ def get_portfolio_timeseries(
     return ts.sort_values("date").reset_index(drop=True)
 
 
-def get_benchmark_timeseries(start_date: date, ref_date: date) -> pd.DataFrame:
+def get_portfolio_market_value_actual(ref_date: date) -> pd.DataFrame:
+    """Täglicher Portfoliowert mit den historisch tatsächlichen Stückzahlen.
+
+    Anders als get_portfolio_timeseries() (konstante aktuelle Stückzahl rückwirkend
+    angewendet) wird hier pro Kurstag je (Depot, ETF) der jüngste Snapshot ≤ diesem
+    Tag verwendet — As-of-Join wie in CLAUDE.md Abschnitt 6 beschrieben. Käufe/Verkäufe
+    zwischen zwei Snapshots erscheinen als Stufe im Chart, nicht als Kursbewegung getarnt.
+
+    Beginnt am ältesten vorhandenen position_snapshot.as_of_date — davor ist die
+    tatsächliche Zusammensetzung unbekannt. Der Startpunkt wandert mit jedem neuen
+    monatlichen Snapshot nicht weiter zurück (Historie wächst nur nach vorn).
+    """
+    bounds = db_utils.query_df(
+        "SELECT MIN(as_of_date) AS start_date FROM portfolio.position_snapshot WHERE as_of_date <= :ref",
+        params={"ref": ref_date},
+    )
+    start_date = bounds["start_date"].iloc[0]
+    if pd.isna(start_date):
+        return pd.DataFrame(columns=["date", "portfolio_eur"])
+
+    snap_df = db_utils.query_df("""
+        SELECT account_id, isin, as_of_date, quantity::float AS quantity
+        FROM portfolio.position_snapshot
+        WHERE as_of_date <= :ref
+        ORDER BY account_id, isin, as_of_date
+    """, params={"ref": ref_date})
+
+    price_df = db_utils.query_df("""
+        SELECT price_date, isin, close::float AS close, currency
+        FROM portfolio.price
+        WHERE price_date BETWEEN :start AND :ref
+        ORDER BY price_date, isin
+    """, params={"start": start_date, "ref": ref_date})
+
+    if snap_df.empty or price_df.empty:
+        return pd.DataFrame(columns=["date", "portfolio_eur"])
+
+    fx_df = db_utils.query_df("""
+        SELECT rate_date, currency, eur_per_unit::float
+        FROM portfolio.fx_rate
+        WHERE rate_date BETWEEN :start AND :ref
+        ORDER BY rate_date, currency
+    """, params={"start": start_date, "ref": ref_date})
+
+    non_eur = price_df[price_df["currency"] != "EUR"]["currency"].unique()
+    if len(non_eur) > 0 and not fx_df.empty:
+        fx_rel = fx_df[fx_df["currency"].isin(non_eur)]
+        if not fx_rel.empty:
+            fx_piv = fx_rel.pivot(index="rate_date", columns="currency", values="eur_per_unit")
+            all_dates = sorted(price_df["price_date"].unique())
+            fx_piv = fx_piv.reindex(all_dates).ffill().bfill()
+            fx_long = (fx_piv.reset_index()
+                       .melt(id_vars=["rate_date"], var_name="currency", value_name="eur_per_unit")
+                       .rename(columns={"rate_date": "price_date"}))
+            price_df = price_df.merge(fx_long, on=["price_date", "currency"], how="left")
+        else:
+            price_df["eur_per_unit"] = None
+    else:
+        price_df["eur_per_unit"] = None
+
+    eur_mask = price_df["currency"] == "EUR"
+    price_df.loc[eur_mask, "eur_per_unit"] = 1.0
+    price_df["eur_per_unit"] = price_df["eur_per_unit"].fillna(1.0)
+    price_df["close_eur"] = price_df["close"] * price_df["eur_per_unit"]
+
+    price_wide = (price_df
+                  .pivot_table(index="price_date", columns="isin",
+                               values="close_eur", aggfunc="last")
+                  .sort_index()
+                  .ffill())
+    all_dates = price_wide.index
+
+    # Stückzahlen je (Depot, ETF) auf die Kurstage forward-fillen. Union statt reindex,
+    # damit Snapshot-Termine, die nicht zufällig auf einen Handelstag fallen, nicht
+    # beim reindex verloren gehen.
+    qty_wide = snap_df.pivot_table(
+        index="as_of_date", columns=["account_id", "isin"], values="quantity", aggfunc="last"
+    )
+    union_index = qty_wide.index.union(all_dates)
+    qty_wide = qty_wide.reindex(union_index).sort_index().ffill().reindex(all_dates)
+
+    # über Depots summieren → eine Spalte je ISIN
+    qty_by_isin = qty_wide.T.groupby(level="isin").sum(min_count=1).T
+
+    common = price_wide.columns.intersection(qty_by_isin.columns)
+    port_values = (price_wide[common] * qty_by_isin[common]).sum(axis=1, min_count=1)
+
+    ts = port_values.reset_index()
+    ts.columns = ["date", "portfolio_eur"]
+    ts["date"] = pd.to_datetime(ts["date"])
+    return ts.dropna().sort_values("date").reset_index(drop=True)
+
+
+def get_benchmark_timeseries(ticker: str, start_date: date, ref_date: date) -> pd.DataFrame:
     """Benchmark-Kurse aus portfolio.benchmark_price; Fallback: yfinance.
 
     Primärquelle ist die DB (nach einmaligem Laden via load_prices.py --since 2023-01-01).
@@ -431,11 +532,11 @@ def get_benchmark_timeseries(start_date: date, ref_date: date) -> pd.DataFrame:
             WHERE ticker = :ticker
               AND price_date BETWEEN :start AND :ref
             ORDER BY price_date
-        """, params={"ticker": BENCHMARK_TICKER, "start": start_date, "ref": ref_date})
+        """, params={"ticker": ticker, "start": start_date, "ref": ref_date})
 
         if not df.empty:
             df["date"] = pd.to_datetime(df["date"])
-            log.info("Benchmark '%s' – %d Tage aus DB geladen", BENCHMARK_TICKER, len(df))
+            log.info("Benchmark '%s' – %d Tage aus DB geladen", ticker, len(df))
             return df.sort_values("date").reset_index(drop=True)
     except Exception as exc:
         log.warning("Benchmark-DB-Abfrage fehlgeschlagen: %s", exc)
@@ -444,7 +545,7 @@ def get_benchmark_timeseries(start_date: date, ref_date: date) -> pd.DataFrame:
     try:
         bm_info = db_utils.query_df(
             "SELECT yf_symbol FROM portfolio.benchmark WHERE ticker = :ticker",
-            params={"ticker": BENCHMARK_TICKER},
+            params={"ticker": ticker},
         )
         yf_sym = bm_info["yf_symbol"].iloc[0] if not bm_info.empty else "EXS1.DE"
     except Exception:
@@ -475,6 +576,39 @@ def get_benchmark_timeseries(start_date: date, ref_date: date) -> pd.DataFrame:
     df.columns = ["date", "benchmark"]
     df["date"] = pd.to_datetime(df["date"])
     return df.sort_values("date").reset_index(drop=True)
+
+
+def get_blended_benchmark_timeseries(
+    weights: dict[str, float], start_date: date, ref_date: date
+) -> pd.DataFrame:
+    """Verkettete Misch-Benchmark aus mehreren Einzel-Tickern (z. B. 60/40 World/Bond).
+
+    Wird zur Laufzeit aus den taeglichen Renditen der Komponenten berechnet (gewichtete
+    Summe), zu einer Indexreihe verkettet (Basis = 100 am ersten gemeinsamen Datum) —
+    kein eigener DB-Eintrag noetig, zieht automatisch nach sobald Komponenten neue Kurse haben.
+    Nur Tage, an denen ALLE Komponenten einen Kurs haben, gehen ein (inner join).
+    """
+    series = {}
+    for ticker in weights:
+        df = get_benchmark_timeseries(ticker, start_date, ref_date)
+        if df.empty:
+            log.warning("Misch-Benchmark: Komponente '%s' ohne Kursdaten – übersprungen", ticker)
+            return pd.DataFrame(columns=["date", "benchmark"])
+        series[ticker] = df.set_index("date")["benchmark"]
+
+    combined = pd.DataFrame(series).dropna(how="any").sort_index()
+    if len(combined) < 2:
+        return pd.DataFrame(columns=["date", "benchmark"])
+
+    returns = combined.pct_change().fillna(0)
+    weight_vec = pd.Series(weights)
+    blended_return = returns[weight_vec.index].mul(weight_vec, axis=1).sum(axis=1)
+    index_level = 100 * (1 + blended_return).cumprod()
+    index_level.iloc[0] = 100.0
+
+    out = index_level.reset_index()
+    out.columns = ["date", "benchmark"]
+    return out
 
 
 def _ts_at_or_before(ts: pd.Series, target: date) -> float | None:
@@ -628,12 +762,45 @@ def chart_sector(df_sector: pd.DataFrame) -> str:
     return _b64_png(fig)
 
 
-def chart_performance(df_port: pd.DataFrame, df_bench: pd.DataFrame, ref_date: date) -> str:
-    """YTD-Liniendiagramm, beide Serien normiert auf 100 zum Jahresanfang."""
+def chart_market_value(df_port: pd.DataFrame) -> str:
+    """Marktwertverlauf Gesamtdepot in absoluten EUR, mit tatsächlichen historischen
+    Stückzahlen (siehe get_portfolio_market_value_actual). Käufe/Verkäufe zwischen zwei
+    Snapshots erscheinen als Stufe, nicht als Kursbewegung getarnt.
+    """
+    if df_port.empty:
+        return ""
+
+    ts = df_port.set_index("date")["portfolio_eur"].astype(float)
+
+    fig, ax = plt.subplots(figsize=(10, 3.8))
+    ax.plot(ts.index, ts.values, color=BLUE, linewidth=1.6)
+    ax.fill_between(ts.index, ts.values, ts.values.min() * 0.98, color=BLUE, alpha=0.08)
+
+    ax.yaxis.set_major_formatter(mticker.FuncFormatter(
+        lambda x, _: f"{x/1000:,.0f} k €".replace(",", ".")))
+    ax.set_ylabel("Marktwert (EUR)", fontsize=9, color=SLATE)
+    ax.set_title("Marktwertverlauf Gesamtdepot (tatsächliche Stückzahlen)", fontsize=11, color=SLATE)
+    ax.tick_params(axis="both", labelsize=8)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.grid(axis="y", alpha=0.25)
+    ax.xaxis.set_major_locator(mdates.AutoDateLocator())
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%d.%m.%y"))
+    fig.patch.set_facecolor("white")
+    fig.tight_layout()
+    return _b64_png(fig)
+
+
+def chart_performance(
+    df_port: pd.DataFrame, benchmarks: list[tuple[pd.DataFrame, str, str, str]], ref_date: date
+) -> str:
+    """YTD-Liniendiagramm, alle Serien normiert auf 100 zum Jahresanfang.
+
+    benchmarks: Liste von (df_bench, name, farbe, linestyle).
+    """
     year_start = pd.Timestamp(date(ref_date.year, 1, 1))
 
-    port  = df_port[df_port["date"] >= year_start].set_index("date")["portfolio_eur"]
-    bench = df_bench[df_bench["date"] >= year_start].set_index("date")["benchmark"] if not df_bench.empty else pd.Series(dtype=float)
+    port = df_port[df_port["date"] >= year_start].set_index("date")["portfolio_eur"]
 
     if port.empty:
         return ""
@@ -644,13 +811,17 @@ def chart_performance(df_port: pd.DataFrame, df_bench: pd.DataFrame, ref_date: d
     ax.plot(port_norm.index, port_norm.values, color=BLUE,
             linewidth=1.8, label="Portfolio (hypothetisch)")
 
-    if not bench.empty:
+    for df_bench, name, color, linestyle in benchmarks:
+        bench = (df_bench[df_bench["date"] >= year_start].set_index("date")["benchmark"]
+                  if not df_bench.empty else pd.Series(dtype=float))
+        if bench.empty:
+            continue
         common = port.index.intersection(bench.index)
         if len(common) >= 5:
             bench_c = bench.reindex(common)
             bench_norm = bench_c / bench_c.iloc[0] * 100
-            ax.plot(bench_norm.index, bench_norm.values, color=ORANGE,
-                    linewidth=1.5, linestyle="--", label=BENCHMARK_NAME)
+            ax.plot(bench_norm.index, bench_norm.values, color=color,
+                    linewidth=1.5, linestyle=linestyle, label=name)
 
     ax.axhline(100, color="#CBD5E1", linewidth=0.8, linestyle=":")
     ax.set_ylabel("Indexiert (Jahresanfang = 100)", fontsize=9, color=SLATE)
@@ -741,7 +912,10 @@ def html_country(df: pd.DataFrame) -> str:
     return f'<table class="data-tbl">\n{rows}</table>'
 
 
-def html_performance_table(periods: list[dict]) -> str:
+def html_performance_table(
+    periods: list[dict], name1: str,
+    periods2: list[dict] | None = None, name2: str | None = None,
+) -> str:
     def _cell(val: float | None, future: bool = False) -> str:
         if future or val is None:
             return '<td class="perf-dash">–</td>'
@@ -752,17 +926,20 @@ def html_performance_table(periods: list[dict]) -> str:
     header = ("<tr>"
               "<th>Periode</th>"
               "<th>Portfolio</th>"
-              f"<th>{BENCHMARK_NAME}</th>"
-              "<th>Differenz</th>"
-              "</tr>\n")
+              f"<th>{name1}</th>"
+              "<th>Differenz</th>")
+    if periods2 is not None:
+        header += f"<th>{name2}</th><th>Differenz</th>"
+    header += "</tr>\n"
+
     rows = header
-    for p in periods:
+    for i, p in enumerate(periods):
         future = p.get("future", False)
-        rows += (f"<tr><td>{p['label']}</td>"
-                 f"{_cell(p['port'], future)}"
-                 f"{_cell(p['bench'], future)}"
-                 f"{_cell(p['diff'], future)}"
-                 "</tr>\n")
+        rows += f"<tr><td>{p['label']}</td>{_cell(p['port'], future)}{_cell(p['bench'], future)}{_cell(p['diff'], future)}"
+        if periods2 is not None:
+            p2 = periods2[i]
+            rows += f"{_cell(p2['bench'], future)}{_cell(p2['diff'], future)}"
+        rows += "</tr>\n"
     return f'<table class="data-tbl perf-tbl">\n{rows}</table>'
 
 
@@ -833,9 +1010,14 @@ def generate_html(ref_date: date) -> str:
     df_port_ts  = get_portfolio_timeseries(ref_date, ts_start, filter_start=False)
     log.info("Lade Portfolio-Zeitreihe (YTD-Chart, gefiltert) ab %s …", ytd_start)
     df_port_ts_ytd = get_portfolio_timeseries(ref_date, ytd_start, filter_start=True)
-    log.info("Lade Benchmark (%s) …", BENCHMARK_TICKER)
-    df_bench_ts = get_benchmark_timeseries(ts_start, ref_date)
-    perf_periods = calc_period_returns(df_port_ts, df_bench_ts, ref_date)
+    log.info("Lade Marktwertverlauf (tatsächliche Stückzahlen) …")
+    df_port_actual = get_portfolio_market_value_actual(ref_date)
+    log.info("Lade Benchmark (%s) …", BENCHMARK_PRIMARY["ticker"])
+    df_bench_ts  = get_benchmark_timeseries(BENCHMARK_PRIMARY["ticker"], ts_start, ref_date)
+    log.info("Lade Misch-Benchmark (%s) …", BENCHMARK_SECONDARY["name"])
+    df_bench_ts2 = get_blended_benchmark_timeseries(BENCHMARK_SECONDARY["weights"], ts_start, ref_date)
+    perf_periods  = calc_period_returns(df_port_ts, df_bench_ts, ref_date)
+    perf_periods2 = calc_period_returns(df_port_ts, df_bench_ts2, ref_date)
 
     # Depot-KPIs
     depot_summen = df_depot.groupby("depot")["wert_eur"].sum().sort_values(ascending=False)
@@ -846,7 +1028,11 @@ def generate_html(ref_date: date) -> str:
     img_pie   = chart_depot_pie(df_depot)
     img_top   = chart_top_holdings(df_top, n=20)
     img_sect  = chart_sector(df_sector)
-    img_perf  = chart_performance(df_port_ts_ytd, df_bench_ts, ref_date)
+    img_value = chart_market_value(df_port_actual)
+    img_perf  = chart_performance(df_port_ts_ytd, [
+        (df_bench_ts,  BENCHMARK_PRIMARY["name"],   ORANGE, "--"),
+        (df_bench_ts2, BENCHMARK_SECONDARY["name"], "#7C3AED", ":"),
+    ], ref_date)
 
     # KPI-Karten (Depots)
     kpis = ""
@@ -910,13 +1096,17 @@ Transaktionshistorie möglich.
 
 <!-- ── Wertentwicklung ── -->
 <h2>Wertentwicklung</h2>
+
+{"<div class='section'><h3>Marktwertverlauf (absolut, tatsächliche Stückzahlen)</h3><p style='color:#64748B;font-size:12px;margin-bottom:8px'>Je Kurstag die zu diesem Zeitpunkt tatsächlich gehaltenen Stückzahlen (letzter Snapshot ≤ Datum) – Käufe/Verkäufe erscheinen als Stufe. Historie beginnt am ältesten Snapshot (" + df_port_actual['date'].min().strftime('%d.%m.%Y') + ") und verlängert sich mit jedem weiteren monatlichen Snapshot.</p><img src='data:image/png;base64," + img_value + "' alt='Marktwertverlauf' style='width:100%;max-width:960px'></div>" if img_value else "<p style='color:#94A3B8;font-size:13px'>Kein Marktwertverlauf (noch kein position_snapshot vorhanden).</p>"}
+
 <div class="warning" style="margin-bottom:12px">
-⚠ <strong>Hypothetische Entwicklung</strong> – konstante Stückzahlen des letzten Snapshots,
-keine Cashflow-Bereinigung. Kein Vergleich zur echten Rendite möglich.
+⚠ <strong>Hypothetische Entwicklung</strong> (nachfolgender Chart und Tabelle) – konstante
+Stückzahlen des letzten Snapshots rückwirkend angewendet, keine Cashflow-Bereinigung.
+Kein Vergleich zur echten Rendite möglich.
 </div>
-{"<div class='section'><img src='data:image/png;base64," + img_perf + "' alt='Performance-Chart' style='width:100%;max-width:960px'></div>" if img_perf else "<p style='color:#94A3B8;font-size:13px'>Kein YTD-Chart (Kursdaten fehlen – bitte <code>python load_prices.py --since " + str(date(ref_date.year, 1, 1)) + "</code> ausführen).</p>"}
+{"<div class='section'><h3>Indexierte Performance vs. Benchmarks (YTD)</h3><img src='data:image/png;base64," + img_perf + "' alt='Performance-Chart' style='width:100%;max-width:960px'></div>" if img_perf else "<p style='color:#94A3B8;font-size:13px'>Kein YTD-Chart (Kursdaten fehlen – bitte <code>python load_prices.py --since " + str(date(ref_date.year, 1, 1)) + "</code> ausführen).</p>"}
 <div class="section">
-{html_performance_table(perf_periods) if perf_periods else "<p style='color:#94A3B8;font-size:13px'>Keine Perioden-Daten verfügbar.</p>"}
+{html_performance_table(perf_periods, BENCHMARK_PRIMARY["name"], perf_periods2, BENCHMARK_SECONDARY["name"]) if perf_periods else "<p style='color:#94A3B8;font-size:13px'>Keine Perioden-Daten verfügbar.</p>"}
 </div>
 
 <!-- ── Look-Through ── -->

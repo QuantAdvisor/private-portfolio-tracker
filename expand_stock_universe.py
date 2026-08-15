@@ -10,11 +10,10 @@ Ausführen (lokal, SSH-Tunnel via db_utils):
     python expand_stock_universe.py --insert --n 300   # fügt bis zu 300 neue Titel ein
 
 Strategie:
-- Priorität: nicht-europäische Länder (US, JP, TW, KR, CA, AU, …) –
-  denn die vorhandene Liste ist bereits EU-lastig.
-- Filter: muss ISIN und Ticker haben (für yfinance-Download im anderen Projekt).
-- Ranking: Häufigkeit in ETF-Holdings (je mehr ETFs einen Titel halten, desto
-  etablierter / liquider ist er) als Qualitäts-Proxy.
+- Länder-Whitelist: MSCI World Developed Markets (US, CA, Europa, JP, AU, HK, SG, NZ, IL).
+  Kein EM (CN, KR, TW, IN, BR, …).
+- Größen-Filter: Nur Titel die in ≥ 2 unserer ETFs enthalten sind (Proxy für Large/Mid-Cap).
+- Ranking: ETF-Häufigkeit absteigend (je mehr ETFs, desto etablierter).
 - Keine Dopplungen: ISINs die bereits in dim_stock_ticker stehen werden übersprungen.
 """
 
@@ -31,10 +30,18 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger(__name__)
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
-EU_COUNTRIES = {
-    "AT", "BE", "CH", "CZ", "DE", "DK", "ES", "FI", "FR", "GB",
-    "GR", "HU", "IE", "IT", "LU", "NL", "NO", "PL", "PT", "SE", "SK",
+# MSCI World Developed Markets (Stand 2024) — kein EM, kein FM
+MSCI_WORLD_COUNTRIES = {
+    # Nordamerika
+    "US", "CA",
+    # Europa
+    "AT", "BE", "CH", "DE", "DK", "ES", "FI", "FR", "GB",
+    "GR", "IE", "IL", "IT", "LU", "NL", "NO", "PT", "SE",
+    # Pazifik
+    "AU", "HK", "JP", "NZ", "SG",
 }
+
+MIN_ETF_COUNT = 2  # Titel muss in ≥ N unserer ETFs liegen (Größen-Proxy)
 
 
 def discover_dim_schema() -> list[str]:
@@ -54,8 +61,33 @@ def get_existing_isins() -> set[str]:
     return set(df["isin"].dropna())
 
 
-def get_candidates(existing_isins: set[str], target: int, prefer_non_eu: bool = True) -> pd.DataFrame:
-    """Top-N Kandidaten aus portfolio.constituent die noch nicht in dim_stock_ticker stehen."""
+def diagnose_constituents() -> None:
+    """Zeigt Datenlage in portfolio.constituent (einmalig zur Diagnose)."""
+    df = db_utils.query_df("""
+        SELECT
+            COUNT(*)                                          AS total,
+            COUNT(ticker)                                     AS with_ticker,
+            COUNT(country)                                    AS with_country,
+            COUNT(CASE WHEN country IS NOT NULL
+                        AND ticker IS NOT NULL THEN 1 END)   AS with_both
+        FROM portfolio.constituent
+    """)
+    log.info("Constituent-Daten: %s", df.to_string(index=False))
+
+    df_ctry = db_utils.query_df("""
+        SELECT country, COUNT(*) AS n
+        FROM portfolio.constituent
+        WHERE country IS NOT NULL
+        GROUP BY country ORDER BY n DESC LIMIT 20
+    """)
+    log.info("Top-Länder in portfolio.constituent:\n%s", df_ctry.to_string(index=False))
+
+
+def get_candidates(existing_isins: set[str], target: int) -> pd.DataFrame:
+    """Top-N Kandidaten aus portfolio.constituent: MSCI World, etf_count >= MIN_ETF_COUNT.
+
+    ticker darf NULL sein (dim_stock_ticker hat nullable ticker-Spalte).
+    """
     df = db_utils.query_df("""
         SELECT
             c.isin,
@@ -69,29 +101,29 @@ def get_candidates(existing_isins: set[str], target: int, prefer_non_eu: bool = 
         FROM portfolio.constituent c
         JOIN portfolio.etf_holding eh ON eh.constituent_isin = c.isin
         WHERE c.isin IS NOT NULL
-          AND c.ticker IS NOT NULL
           AND c.name IS NOT NULL
         GROUP BY c.isin, c.ticker, c.name, c.sektor, c.country, c.currency, c.wkn
         ORDER BY COUNT(DISTINCT eh.etf_isin) DESC, c.name
     """)
 
-    # Bereits vorhandene ISINs ausfiltern
     df = df[~df["isin"].isin(existing_isins)].copy()
 
-    if prefer_non_eu:
-        # Erst Nicht-EU, dann EU (um die EU-Lastigkeit zu reduzieren)
-        df["eu_flag"] = df["country"].isin(EU_COUNTRIES).astype(int)
-        df = df.sort_values(["eu_flag", "etf_count"], ascending=[True, False])
-    else:
-        df = df.sort_values("etf_count", ascending=False)
+    # Nur MSCI World Developed Markets
+    before = len(df)
+    df = df[df["country"].isin(MSCI_WORLD_COUNTRIES)]
+    log.info("Länder-Filter (MSCI World): %d → %d Titel", before, len(df))
 
-    df = df.head(target).reset_index(drop=True)
+    # Nur Titel in ≥ MIN_ETF_COUNT ETFs (Größen-Proxy)
+    before = len(df)
+    df = df[df["etf_count"] >= MIN_ETF_COUNT]
+    log.info("Größen-Filter (etf_count ≥ %d): %d → %d Titel", MIN_ETF_COUNT, before, len(df))
+
+    df = df.sort_values("etf_count", ascending=False).head(target).reset_index(drop=True)
 
     log.info(
-        "Kandidaten: %d gesamt | %d Nicht-EU | %d EU",
+        "Finale Kandidaten: %d | Top-Länder: %s",
         len(df),
-        (~df["country"].isin(EU_COUNTRIES)).sum(),
-        df["country"].isin(EU_COUNTRIES).sum(),
+        df["country"].value_counts().head(5).to_dict(),
     )
     return df
 
@@ -155,13 +187,16 @@ def main():
     existing = get_existing_isins()
     log.info("Aktuell in dim_stock_ticker: %d ISINs", len(existing))
 
+    log.info("=== Diagnose portfolio.constituent ===")
+    diagnose_constituents()
+
     log.info("=== Kandidaten aus portfolio.constituent ===")
-    candidates = get_candidates(existing, target=args.n, prefer_non_eu=True)
+    candidates = get_candidates(existing, target=args.n)
 
     # Vorschau
     pd.set_option("display.max_rows", 50)
     log.info(
-        "Top-20 Kandidaten (sortiert nach EU-Status, dann ETF-Häufigkeit):\n%s",
+        "Top-20 Kandidaten (sortiert nach ETF-Häufigkeit):\n%s",
         candidates[["isin", "ticker", "name", "country", "sektor", "etf_count"]]
         .head(20)
         .to_string(index=False),
