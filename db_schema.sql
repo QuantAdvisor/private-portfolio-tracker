@@ -153,7 +153,8 @@ INSERT INTO portfolio.account (name, broker, account_type) VALUES
     ('Scalable Christian',        'Scalable',       'Brokerdepot'),
     ('Ing Gemeinschaftsdepot',    'ING',            'Gemeinschaftsdepot'),
     ('Christian Riester',         'DWS/Riester',    'Riester'),
-    ('Christian Trade Republic',  'Trade Republic', 'Brokerdepot')
+    ('Christian Trade Republic',  'Trade Republic', 'Brokerdepot'),
+    ('Christian Oskar VL',        'Oskar',          'VL-Sparplan')
 ON CONFLICT (name) DO NOTHING;
 
 -- ── Seed-Daten: ETF-Stammdaten ────────────────────────────────────────────────
@@ -225,6 +226,54 @@ CREATE TABLE IF NOT EXISTS portfolio.benchmark_price (
 
 CREATE INDEX IF NOT EXISTS ix_benchmark_price_date
     ON portfolio.benchmark_price (ticker, price_date DESC);
+
+-- ── Transaktionen (Scalable, Trade Republic) ─────────────────────────────────
+-- Volle Kontobewegungshistorie (nicht nur Buy/Sell) je Depot, fuer spaetere
+-- MWR/TWR-Berechnung (siehe claude.md Abschnitt 7: "Spaeter: Transaktions-
+-- historie -> MWR/TWR"). APPEND/UPSERT, nie DELETE.
+--
+-- isin ist bewusst NICHT als FK auf portfolio.etf definiert: portfolio.etf
+-- ist ausschliesslich die aktuell getrackten ETFs. Trade Republic enthaelt
+-- aber Einzelaktien-/Derivate-Historie (z.B. einzelne Aktien, gehebelte
+-- Zertifikate), die nie in portfolio.etf landen sollen. Eine FK wuerde
+-- entweder diese Buchhaltungszeilen ablehnen oder portfolio.etf verwaessern.
+CREATE TABLE IF NOT EXISTS portfolio.transaction (
+    account_id         INTEGER      NOT NULL REFERENCES portfolio.account(account_id),
+    broker_ref         VARCHAR(120) NOT NULL,   -- Scalable 'reference' | TR 'transaction_id'
+    source_system      VARCHAR(20)  NOT NULL,   -- 'scalable' | 'traderepublic'
+    txn_datetime        TIMESTAMPTZ  NOT NULL,
+    txn_date             DATE         NOT NULL,   -- rohe Quell-Datumsspalte (TZ-robuster Join-Schluessel)
+    txn_type              VARCHAR(24)  NOT NULL,   -- normalisierte Taxonomie, siehe CHECK
+    raw_category          VARCHAR(80)  NOT NULL,   -- Original-Kombination, z.B. 'Security|Savings plan'
+    isin                   VARCHAR(12),             -- NULL bei Cash-only; keine FK (s.o.)
+    security_name        VARCHAR(200),
+    quantity               NUMERIC(18, 6),          -- signiert: + Zugang, - Abgang; NULL bei Cash-only
+    price                   NUMERIC(18, 6),
+    gross_amount          NUMERIC(18, 4),          -- signierter Cash-Effekt, Quellvorzeichen uebernommen
+    fee                     NUMERIC(18, 4)  NOT NULL DEFAULT 0,
+    tax                     NUMERIC(18, 4)  NOT NULL DEFAULT 0,
+    currency               VARCHAR(3)   NOT NULL,
+    original_amount        NUMERIC(18, 4),          -- TR-only: Betrag vor FX-Umrechnung
+    original_currency      VARCHAR(3),
+    fx_rate_applied         NUMERIC(18, 6),
+    status                  VARCHAR(20)  NOT NULL DEFAULT 'Executed',
+    loaded_at               TIMESTAMPTZ  NOT NULL DEFAULT now(),
+    PRIMARY KEY (account_id, broker_ref),
+    CONSTRAINT chk_transaction_txn_type CHECK (txn_type IN (
+        'BUY', 'SELL', 'DRIP', 'FREE_RECEIPT',
+        'TRANSFER_SECURITY_IN', 'TRANSFER_SECURITY_OUT',
+        'DIVIDEND', 'FEE', 'INTEREST', 'TAX',
+        'DEPOSIT', 'WITHDRAWAL', 'CASH_TRANSFER_IN', 'CASH_TRANSFER_OUT',
+        'CARD_TRANSACTION', 'CASHBACK', 'OTHER'
+    ))
+);
+
+CREATE INDEX IF NOT EXISTS ix_transaction_account_isin_date
+    ON portfolio.transaction (account_id, isin, txn_date);
+CREATE INDEX IF NOT EXISTS ix_transaction_date
+    ON portfolio.transaction (txn_date);
+CREATE INDEX IF NOT EXISTS ix_transaction_type
+    ON portfolio.transaction (txn_type);
 
 INSERT INTO portfolio.benchmark (ticker, name, yf_symbol, currency) VALUES
     ('MSCI_WORLD',       'iShares Core MSCI World UCITS ETF Acc (EUNL.DE)',                       'EUNL.DE',  'EUR'),

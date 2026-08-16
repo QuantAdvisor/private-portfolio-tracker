@@ -220,6 +220,84 @@ def write_unresolved(records: list[dict]) -> None:
     db_utils.execute_many(UPSERT_UNRESOLVED, records)
 
 
+# ── Transaktionen (Scalable, Trade Republic) ─────────────────────────────────
+
+TXN_TYPES: set[str] = {
+    "BUY", "SELL", "DRIP", "FREE_RECEIPT",
+    "TRANSFER_SECURITY_IN", "TRANSFER_SECURITY_OUT",
+    "DIVIDEND", "FEE", "INTEREST", "TAX",
+    "DEPOSIT", "WITHDRAWAL", "CASH_TRANSFER_IN", "CASH_TRANSFER_OUT",
+    "CARD_TRANSACTION", "CASHBACK", "OTHER",
+}
+
+UPSERT_TRANSACTION = """
+INSERT INTO portfolio.transaction (
+    account_id, broker_ref, source_system, txn_datetime, txn_date, txn_type,
+    raw_category, isin, security_name, quantity, price, gross_amount, fee, tax,
+    currency, original_amount, original_currency, fx_rate_applied, status
+) VALUES (
+    :account_id, :broker_ref, :source_system, :txn_datetime, :txn_date, :txn_type,
+    :raw_category, :isin, :security_name, :quantity, :price, :gross_amount, :fee, :tax,
+    :currency, :original_amount, :original_currency, :fx_rate_applied, :status
+)
+ON CONFLICT (account_id, broker_ref) DO UPDATE SET
+    source_system      = EXCLUDED.source_system,
+    txn_datetime        = EXCLUDED.txn_datetime,
+    txn_date             = EXCLUDED.txn_date,
+    txn_type              = EXCLUDED.txn_type,
+    raw_category          = EXCLUDED.raw_category,
+    isin                   = EXCLUDED.isin,
+    security_name        = EXCLUDED.security_name,
+    quantity               = EXCLUDED.quantity,
+    price                   = EXCLUDED.price,
+    gross_amount          = EXCLUDED.gross_amount,
+    fee                     = EXCLUDED.fee,
+    tax                     = EXCLUDED.tax,
+    currency               = EXCLUDED.currency,
+    original_amount        = EXCLUDED.original_amount,
+    original_currency      = EXCLUDED.original_currency,
+    fx_rate_applied         = EXCLUDED.fx_rate_applied,
+    status                  = EXCLUDED.status,
+    loaded_at                = now()
+"""
+
+
+def write_transactions(rows: list[dict]) -> None:
+    """Idempotenter Bulk-Upsert nach portfolio.transaction. Prueft die
+    txn_type-Werte vor dem Schreiben (fail fast statt DB-CHECK-Fehler mitten
+    im Batch).
+
+    Dedupliziert vorher nach (account_id, broker_ref): Postgres wirft
+    'ON CONFLICT DO UPDATE command cannot affect row a second time', wenn
+    derselbe Konfliktschluessel zweimal im selben INSERT-Batch vorkommt - das
+    passiert garantiert bei doppelt heruntergeladenen PDFs (z.B. ING-Dateien
+    mit " (1)"-Suffix, identischer Inhalt, identische Ordernummer). Letzter
+    Eintrag gewinnt; eine Kollision mit UNTERSCHIEDLICHEM Inhalt wird geloggt,
+    da das auf einen echten broker_ref-Konflikt statt auf ein reines
+    Re-Download-Duplikat hindeuten wuerde."""
+    bad = {r["txn_type"] for r in rows} - TXN_TYPES
+    if bad:
+        raise ValueError(f"Unbekannte txn_type-Werte, Mapping unvollstaendig: {bad}")
+
+    by_key: dict[tuple, dict] = {}
+    collisions = 0
+    for r in rows:
+        key = (r["account_id"], r["broker_ref"])
+        prev = by_key.get(key)
+        if prev is not None and prev != r:
+            collisions += 1
+        by_key[key] = r
+    if collisions:
+        log.warning(
+            "%d broker_ref-Kollision(en) mit unterschiedlichem Inhalt gefunden "
+            "(letzter Eintrag gewinnt) - bitte pruefen, ob das echte Duplikate sind.",
+            collisions,
+        )
+    deduped = list(by_key.values())
+
+    db_utils.execute_many(UPSERT_TRANSACTION, deduped)
+
+
 # ── Gewicht-Plausibilitätsprüfung ─────────────────────────────────────────────
 
 def log_weight_sums(rows: list[dict], weight_key: str = "weight_pct") -> None:

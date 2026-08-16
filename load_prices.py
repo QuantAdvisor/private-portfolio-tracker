@@ -76,6 +76,11 @@ YF_TICKER_OVERRIDE: dict[str, str] = {
     # Korrekt: IEMA.AS (Euronext Amsterdam, EUR-gelistet, iShares MSCI EM Acc).
     # Verifiziert gegen ING-App: ISHSIII-MSCI EM USD(ACC) = 58,502 EUR
     "IE00B4L5YC18": "IEMA.AS",   # iShares MSCI EM Acc → yfinance-Symbol gibt ~58,61 EUR
+    # Oskar VL-Sparplan – Preis-Backfill (siehe PROJECT_PLAN.md Abschnitt 14-E):
+    "IE00BFXR5W90": "LGAG.L",     # L&G Asia Pacific ex Japan – LSE, quotiert in GBp (Pence)
+    "IE00BKS7L097": "SPXE.L",     # Invesco S&P 500 Scored & Screened – LSE, quotiert in USD
+    "IE00BKSCBX74": "WSCSRI.SW",  # UBS MSCI World Small Cap SRI – SIX, quotiert in USD
+    "IE000O5FBC47": "CLMT.L",     # Amundi S&P 500 Climate Paris Aligned – LSE, quotiert in GBP (nicht Pence)
 }
 
 # ISINs, für die kein yfinance-Ticker existiert.
@@ -85,7 +90,13 @@ YF_TICKER_OVERRIDE: dict[str, str] = {
 YF_NO_PRICE: set[str] = set()  # alle 24 ETFs haben nun einen yfinance-Ticker
 
 # Für LSE-Ticker: yfinance liefert Preise in GBp (Pence) → durch 100 teilen
-GBP_PENCE_TICKERS: set[str] = {"LGQD.L"}
+GBP_PENCE_TICKERS: set[str] = {"LGQD.L", "LGAG.L"}
+
+# LSE/SIX-Ticker mit USD-Handelswährung (verifiziert: Preisniveau passt nicht zu GBp/CHF)
+USD_TICKERS: set[str] = {"SPXE.L", "WSCSRI.SW"}
+
+# LSE-Ticker, die (untypisch) direkt in GBP statt GBp notieren (verifiziert am Preisniveau)
+GBP_DIRECT_TICKERS: set[str] = {"CLMT.L"}
 
 
 # ── FX-Kurse ──────────────────────────────────────────────────────────────────
@@ -155,12 +166,26 @@ def load_etf_prices(start: date, end: date) -> int:
         yf_sym = YF_TICKER_OVERRIDE.get(isin, f"{ticker}.DE")
 
         try:
+            # auto_adjust=False (bewusst, verifiziert 2026-08-16): yfinance passt bei
+            # auto_adjust=True die HISTORISCHEN Schlusskurse rueckwirkend um alle seither
+            # gezahlten Dividenden nach unten an (Total-Return-Stil) - bei ausschuettenden
+            # ("Dist") ETFs verzerrt das jeden alten Kurs umso staerker, je laenger die
+            # Dividendenhistorie seither ist. Dieses System trackt Dividenden bereits separat
+            # als echte Cashflows (portfolio.transaction, txn_type=DIVIDEND) - eine zusaetzliche
+            # rueckwirkende Preisanpassung fuehrt zu einer Diskrepanz zwischen dem im System
+          # gespeicherten Kurs und dem tatsaechlich vom Broker abgerechneten Kurs.
+            # Konkret gefunden: IE00B0M63060 (IQQD, Dist) zeigte am 2023-11-01 einen
+            # adjustierten Kurs von 6,34 EUR, waehrend der echte Scalable-Abrechnungskurs
+            # 7,301 EUR betrug (der unadjustierte Kurs 7,345 EUR liegt nur 0,6% daneben -
+            # normale Handelsspanne). Dieser ~13%-Fehler zog einen Phantom-Tagesverlust von
+            # -17% in Scalables TWR-Kette. auto_adjust=False behebt das systematisch fuer
+            # alle ausschuettenden ETFs im Preisbestand, nicht nur diesen einen Fall.
             hist = yf.download(
                 yf_sym,
                 start=start_str,
                 end=end_str,
                 progress=False,
-                auto_adjust=True,
+                auto_adjust=False,
             )
         except Exception as exc:
             log.warning("%-14s (%s) – Download-Fehler: %s", isin, yf_sym, exc)
@@ -177,7 +202,14 @@ def load_etf_prices(start: date, end: date) -> int:
             hist.columns = hist.columns.get_level_values(0)
 
         close_col = "Close" if "Close" in hist.columns else hist.columns[0]
-        currency = "GBp" if yf_sym in GBP_PENCE_TICKERS else "EUR"
+        if yf_sym in GBP_PENCE_TICKERS:
+            currency = "GBp"
+        elif yf_sym in USD_TICKERS:
+            currency = "USD"
+        elif yf_sym in GBP_DIRECT_TICKERS:
+            currency = "GBP"
+        else:
+            currency = "EUR"
 
         records = []
         for idx, price_row in hist.iterrows():
