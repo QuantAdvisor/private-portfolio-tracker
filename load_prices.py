@@ -343,8 +343,18 @@ def load_benchmark_prices(start: date, end: date) -> int:
         yf_sym    = row["yf_symbol"]
 
         try:
+            # auto_adjust=False (konsistent mit dem ETF-Preis-Loader oben, verifiziert
+            # 2026-08-17): von den 6 Benchmarks sind EURO_STOXX_50 (EXW1.DE) und
+            # STOXX_EU_600 (EXSA.DE) tatsaechlich ausschuettende Fonds (55/56 Dividenden-
+            # Events lt. yfinance) - ohne diesen Fix waeren ihre historischen Kurse vom
+            # selben rueckwirkenden Total-Return-Adjustment-Bug betroffen wie urspruenglich
+            # bei den Portfolio-ETFs gefunden. MSCI_WORLD (EUNL.DE) und GLOBAL_AGG_BOND_H
+            # (EUNA.DE) - die einzigen beiden, die tatsaechlich in TARGET_BENCHMARK_CODES
+            # fuer die TE-Berechnung verwendet werden - sind reine Acc-Fonds (0 Dividenden-
+            # Events), also von diesem Bug nicht betroffen; der Fix ist trotzdem fuer alle
+            # Benchmarks korrekt, falls EURO_STOXX_50/STOXX_EU_600 kuenftig genutzt werden.
             hist = yf.download(
-                yf_sym, start=start_str, end=end_str, progress=False, auto_adjust=True
+                yf_sym, start=start_str, end=end_str, progress=False, auto_adjust=False
             )
         except Exception as exc:
             log.warning("Benchmark %-15s (%s) – Download-Fehler: %s", bm_ticker, yf_sym, exc)

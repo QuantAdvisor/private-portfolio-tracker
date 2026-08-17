@@ -281,10 +281,20 @@ INSERT INTO portfolio.benchmark (ticker, name, yf_symbol, currency) VALUES
     ('EURO_STOXX_50',    'iShares Core Euro STOXX 50 (EXW1.DE)',                                  'EXW1.DE',  'EUR'),
     ('STOXX_EU_600',     'iShares STOXX Europe 600 (EXSA.DE)',                                    'EXSA.DE',  'EUR'),
     ('MSCI_ACWI',        'iShares MSCI ACWI UCITS ETF (IUSQ.DE)',                                 'IUSQ.DE',  'EUR'),
-    ('GLOBAL_AGG_BOND_H','iShares Core Global Aggregate Bond UCITS ETF EUR Hedged Acc (EUNA.DE)', 'EUNA.DE',  'EUR')
+    ('GLOBAL_AGG_BOND_H','iShares Core Global Aggregate Bond UCITS ETF EUR Hedged Acc (EUNA.DE)', 'EUNA.DE',  'EUR'),
+    ('CORP_BOND_IG',     'iShares Global Corp Bond UCITS ETF EUR Hedged (Dist, IBCQ.DE)',         'IBCQ.DE',  'EUR')
 ON CONFLICT (ticker) DO NOTHING;
 -- Hinweis: NASDAQ_100 yf_symbol wurde nachtraeglich auf 'CNDX.AS' korrigiert (CSNDX.DE delisted,
 -- siehe Server-Deployment-Log), CSNDX.DE hier nur als urspruengliche Seed-Referenz belassen.
 -- MSCI_WORLD 2026-08-08 von EXS1.DE (Dist) auf EUNL.DE (Acc, WKN A0RPWH) umgestellt (User-Wunsch).
 -- GLOBAL_AGG_BOND_H 2026-08-08 neu: Komponente der 60/40-Misch-Benchmark in generate_report.py
 -- (wird dort zur Laufzeit mit MSCI_WORLD verkettet, kein eigener "MIX"-Tabelleneintrag).
+-- CORP_BOND_IG 2026-08-17 neu: vorgesehene TE-Benchmark fuer kuenftige Renten-ETFs
+-- (Fachkonzept-Assetklasse "Credit IG"), Nutzerwunsch: global, EUR-hedged, kein
+-- reiner EUR-Corporate-Index. Zunaechst IBCX.DE (nur EUR) gewaehlt, auf
+-- Nutzerkorrektur auf IBCQ.DE (iShares Global Corp Bond EUR Hedged, Dist,
+-- Bloomberg Global Aggregate Corporate Index EUR Hedged) umgestellt. Ist ein
+-- Dist-Fonds (26 Dividenden-Events lt. yfinance) - profitiert vom
+-- auto_adjust=False-Fix im Benchmark-Loader. Bisher nur die Benchmark-
+-- Kursreihe angelegt, noch keine Renten-ETFs im Bestand, die dagegen
+-- gemessen werden.
