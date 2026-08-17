@@ -9,16 +9,18 @@ Ablauf:
 .env auf dem Server (zusätzlich zu den DB-Credentials):
     SMTP_HOST=smtp.gmail.com
     SMTP_PORT=587
-    SMTP_USER=absender@gmail.com
-    SMTP_PASSWORD=<Google-App-Passwort>
-    MAIL_FROM=absender@gmail.com
-    MAIL_TO=Christian_Schott@quant-advisor.de
+    SMTP_USER=trades@quant-advisor.de
+    SMTP_PASSWORD=<App-Passwort>
+    MAIL_FROM=trades@quant-advisor.de
+    MAIL_TO=christian.schott@quant-advisor.de
+    MAIL_TO_PORTFOLIO_REPORT=christian.schott@quant-advisor.de,tina.schott@gmx.de
 
 Crontab (täglich Mo–Fr, 09:10 – nach Kurs-Update):
     10 9 * * 1-5 cd /pfad/zum/projekt && /pfad/zum/venv/bin/python etf_tracker_send_report.py
 """
 
 import logging
+import os
 import sys
 import traceback
 from datetime import date, datetime
@@ -125,7 +127,7 @@ def main() -> None:
         )
         sys.exit(1)
 
-    _send_mail(subject, html)
+    _send_mail(subject, html, to=os.environ.get("MAIL_TO_PORTFOLIO_REPORT"))
     log.info("=== Fertig ===")
 
 

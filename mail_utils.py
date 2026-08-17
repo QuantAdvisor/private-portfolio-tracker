@@ -5,10 +5,14 @@ zweiter Konsument (send_diagnostic_report.py) dieselbe Logik brauchte.
 .env (Server, zusaetzlich zu den DB-Credentials):
     SMTP_HOST=smtp.gmail.com
     SMTP_PORT=587
-    SMTP_USER=absender@gmail.com
-    SMTP_PASSWORD=<Google-App-Passwort>
-    MAIL_FROM=absender@gmail.com
-    MAIL_TO=Christian_Schott@quant-advisor.de
+    SMTP_USER=trades@quant-advisor.de
+    SMTP_PASSWORD=<App-Passwort>
+    MAIL_FROM=trades@quant-advisor.de
+    MAIL_TO=christian.schott@quant-advisor.de
+    # Optional, nur fuer den Portfolio-Report (etf_tracker_send_report.py) -
+    # faellt auf MAIL_TO zurueck, falls nicht gesetzt. Der Diagnose-Report
+    # (send_diagnostic_report.py) nutzt weiterhin nur MAIL_TO.
+    MAIL_TO_PORTFOLIO_REPORT=christian.schott@quant-advisor.de,tina.schott@gmx.de
 """
 
 from __future__ import annotations
@@ -29,12 +33,16 @@ MAIL_FROM = os.environ.get("MAIL_FROM", SMTP_USER)
 MAIL_TO = os.environ.get("MAIL_TO", "")
 
 
-def send_mail(subject: str, html_body: str) -> None:
-    if not SMTP_USER or not MAIL_TO:
-        log.warning("SMTP_USER / MAIL_TO nicht konfiguriert - kein E-Mail-Versand.")
+def send_mail(subject: str, html_body: str, to: str | None = None) -> None:
+    """to: optionale Empfaenger-Liste (kommagetrennt), ueberschreibt MAIL_TO
+    fuer diesen einen Versand - z.B. der Portfolio-Report an einen groesseren
+    Verteiler als der technische Diagnose-Report."""
+    mail_to = to if to else MAIL_TO
+    if not SMTP_USER or not mail_to:
+        log.warning("SMTP_USER / Empfaenger nicht konfiguriert - kein E-Mail-Versand.")
         return
 
-    recipients = [r.strip() for r in MAIL_TO.split(",") if r.strip()]
+    recipients = [r.strip() for r in mail_to.split(",") if r.strip()]
     msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
     msg["From"] = MAIL_FROM
