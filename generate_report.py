@@ -1165,18 +1165,21 @@ footer { text-align: center; color: #94A3B8; font-size: 11px; margin-top: 32px;
 
 def generate_html(ref_date: date) -> str:
     """2026-08-17 neu zugeschnitten (Nutzerwunsch): aus dem alten Report bleiben
-    nur Look-Through (Einzeltitel) und der Marktwertverlauf (jetzt 2 Charts,
-    3 Jahre + seit Beginn, aus der vollen Transaktions-Historie statt der alten
-    41-Tage-Snapshot-Quelle). Depot-Pie/-Tabelle, Sektor-/Länder-Allokation und
-    ETF-Überlappung sind bewusst nicht mehr Teil der Ausgabe (Funktionen bleiben
-    im Modul erhalten, falls später wieder gebraucht). Neu: echte TWR-Performance
-    vs. Benchmarks und ein Fachkonzept-Kennzahlen-Abschnitt (TE, TE-Limit-Ampel,
-    MCTR) - siehe "TWR & Fachkonzept-Kennzahlen" weiter oben im Modul."""
+    Look-Through (Einzeltitel, Sektor/Land, ETF-Überlappung) und der
+    Marktwertverlauf (jetzt 2 Charts, 3 Jahre + seit Beginn, aus der vollen
+    Transaktions-Historie statt der alten 41-Tage-Snapshot-Quelle). Nur die
+    Depot-Pie/-Tabelle ist raus (Funktion bleibt im Modul erhalten, falls
+    später wieder gebraucht). Neu: echte TWR-Performance vs. Benchmarks und
+    ein Fachkonzept-Kennzahlen-Abschnitt (TE, TE-Limit-Ampel, MCTR) - siehe
+    "TWR & Fachkonzept-Kennzahlen" weiter oben im Modul."""
     log.info("Lade Daten für %s …", ref_date)
 
-    df_depot = get_depot_breakdown(ref_date)
-    df_top   = get_top_holdings(ref_date, n=30)
-    cov      = get_coverage(ref_date)
+    df_depot   = get_depot_breakdown(ref_date)
+    df_top     = get_top_holdings(ref_date, n=30)
+    df_sector  = get_sector_allocation(ref_date)
+    df_country = get_country_allocation(ref_date)
+    df_overlap = get_etf_overlap(ref_date)
+    cov        = get_coverage(ref_date)
 
     log.info("Gesamtwert: %.2f EUR, Look-Through-Abdeckung: %.1f %%",
              cov["gesamt_eur"], cov["coverage_pct"])
@@ -1210,6 +1213,7 @@ def generate_html(ref_date: date) -> str:
 
     log.info("Erstelle Charts …")
     img_top      = chart_top_holdings(df_top, n=20)
+    img_sect     = chart_sector(df_sector)
     img_value_3y  = chart_market_value(df_value_3y)
     img_value_all = chart_market_value(df_value_all)
     img_twr = chart_performance(df_twr_idx_ytd, [
@@ -1321,6 +1325,30 @@ Effektives Engagement addiert über alle ETFs und Depots hinweg (Kurs × Stückz
 <img src="data:image/png;base64,{img_top}" alt="Top-Titel" style="width:100%;max-width:860px">
 <h3>Top-30 Einzeltitel</h3>
 {html_top_holdings(df_top)}
+</div>
+
+<!-- ── Sektor und Land ── -->
+<h2>Allokation (Look-Through)</h2>
+<div class="section">
+<div class="chart-row">
+    <div style="flex:2">
+        <img src="data:image/png;base64,{img_sect}" alt="Sektor" style="width:100%">
+    </div>
+    <div style="flex:1">
+        <h3>Länder-Allokation (Top 15)</h3>
+        {html_country(df_country)}
+    </div>
+</div>
+</div>
+
+<!-- ── ETF-Überlappung ── -->
+<h2>ETF-Überlappung (Redundanz)</h2>
+<p style="color:#64748B;font-size:13px;margin-bottom:12px;">
+Paarweise Gewichts-Überschneidung: Σ min(Gewicht_A, Gewicht_B) über alle gemeinsamen Titel.
+Hohe Überlappung bedeutet Redundanz zwischen zwei ETFs.
+</p>
+<div class="section">
+{html_overlap(df_overlap)}
 </div>
 
 <footer>
