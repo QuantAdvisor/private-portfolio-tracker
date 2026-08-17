@@ -611,6 +611,127 @@ def get_blended_benchmark_timeseries(
     return out
 
 
+# ── TWR & Fachkonzept-Kennzahlen (2026-08-17 ergaenzt) ───────────────────────
+#
+# Ab hier: ECHTE Rendite (transaktionsbasierte TWR aus portfolio_intelligence,
+# siehe private-portfolio-tracker/claude.md Abschnitt "spaeter: Transaktions-
+# historie -> MWR/TWR"). Im Unterschied zu den obigen Look-Through-Funktionen
+# (weiterhin snapshot-basiert, punktuelle Bestandsanalyse - bleibt bewusst
+# unveraendert) rechnet dieser Teil mit taeglich cashflow-bereinigter TWR aus
+# Phase 12/13 sowie Tracking Error/NormRt/MCTR aus Phase 10/16/17.
+
+def get_twr_index(start_date: date, ref_date: date) -> pd.DataFrame:
+    """Gesamtdepot-TWR als Indexreihe (100 = erster Tag der Historie), aus
+    twr_daily_total.cumulative_twr_pct. Spaltennamen bewusst identisch zu
+    get_portfolio_timeseries() (date/portfolio_eur), damit chart_performance()
+    und calc_period_returns() unveraendert wiederverwendet werden koennen -
+    beide arbeiten intern nur mit Verhaeltnissen, nicht mit absoluten EUR."""
+    df = db_utils.query_df("""
+        SELECT valuation_date AS date, (100 * (1 + cumulative_twr_pct / 100.0)) AS portfolio_eur
+        FROM portfolio_intelligence.twr_daily_total
+        WHERE valuation_date BETWEEN :start AND :ref
+        ORDER BY valuation_date
+    """, params={"start": start_date, "ref": ref_date})
+    if df.empty:
+        return df
+    df["date"] = pd.to_datetime(df["date"])
+    return df
+
+
+def get_benchmark_index_from_intelligence(code: str, start_date: date, ref_date: date) -> pd.DataFrame:
+    """Benchmark-Indexreihe aus portfolio_intelligence.benchmark_performance
+    (Phase 4 - bereits fertig materialisiert, inkl. 60/40-Mischbenchmark,
+    kein Laufzeit-Verketten wie bei get_blended_benchmark_timeseries() noetig)."""
+    df = db_utils.query_df("""
+        SELECT bp.performance_date AS date, bp.close_price AS benchmark
+        FROM portfolio_intelligence.benchmark_performance bp
+        JOIN portfolio_intelligence.benchmark_profile prof ON prof.benchmark_id = bp.benchmark_id
+        WHERE prof.code = :code AND bp.performance_date BETWEEN :start AND :ref
+        ORDER BY bp.performance_date
+    """, params={"code": code, "start": start_date, "ref": ref_date})
+    if df.empty:
+        return df
+    df["date"] = pd.to_datetime(df["date"])
+    return df
+
+
+def get_twr_account_summary() -> pd.DataFrame:
+    """Kumulierte TWR je Depot (juengster Stand) - fuer die KPI-Zeile."""
+    return db_utils.query_df("""
+        SELECT av.account_name, td.cumulative_twr_pct
+        FROM portfolio_intelligence.twr_daily td
+        JOIN portfolio_intelligence.account_view av ON av.account_view_id = td.account_view_id
+        WHERE td.valuation_date = (SELECT MAX(valuation_date) FROM portfolio_intelligence.twr_daily)
+        ORDER BY td.cumulative_twr_pct DESC
+    """)
+
+
+def get_te_table() -> pd.DataFrame:
+    """Tracking Error je Depot/Gesamt vs. beide Policy-Benchmarks, 3 Fenster -
+    direkt aus der Dashboard-View, keine eigene Logik noetig."""
+    return db_utils.query_df("""
+        SELECT series_name, benchmark_code, window_days, tracking_error_pct, is_full_window
+        FROM portfolio_intelligence.v_dashboard_portfolio_te
+        ORDER BY CASE WHEN series_name = 'Gesamtportfolio' THEN 0 ELSE 1 END, series_name, benchmark_code, window_days
+    """)
+
+
+def get_mandate_ampel_table(window_days: int = 60) -> pd.DataFrame:
+    """TE-Limit-Auslastung je Mandat ggue. MSCI World, 60-Tage-Fenster -
+    zeigt nur Mandate mit gesetztem Limit (Phase 11), sortiert nach Ampel-
+    Schwere (rot zuerst)."""
+    return db_utils.query_df("""
+        SELECT a.name, ter.tracking_error_annualized AS te_pct, ter.te_limit_pct,
+               ter.utilization_pct, ter.traffic_light
+        FROM portfolio_intelligence.tracking_error_rolling ter
+        JOIN portfolio_intelligence.etf_mandate em ON em.mandate_id = ter.entity_id
+        JOIN portfolio_intelligence.asset a ON a.asset_id = em.asset_id
+        JOIN portfolio_intelligence.benchmark_profile bp ON bp.benchmark_id = ter.benchmark_id
+        WHERE ter.entity_type = 'mandate' AND ter.window_days = :wd AND bp.code = 'MSCI_WORLD'
+          AND ter.te_limit_pct IS NOT NULL
+          AND ter.calc_date = (SELECT MAX(calc_date) FROM portfolio_intelligence.tracking_error_rolling)
+        ORDER BY CASE ter.traffic_light WHEN 'red' THEN 0 WHEN 'yellow' THEN 1 ELSE 2 END,
+                 ter.utilization_pct DESC
+    """, params={"wd": window_days})
+
+
+def get_total_market_value(start_date: date | None, ref_date: date) -> pd.DataFrame:
+    """Marktwertverlauf Gesamtdepot, transaktionsbasiert (entity_daily_valuation,
+    entity_type='total' - siehe Phase-9-Migration 2026-08-17, volle Historie
+    seit 2018 statt vorher 41 Tage aus dem monatlichen Snapshot). Ersetzt
+    get_portfolio_market_value_actual() als Datenquelle fuer den Marktwert-
+    Chart. start_date=None laedt die gesamte verfuegbare Historie."""
+    params = {"ref": ref_date}
+    where_start = ""
+    if start_date is not None:
+        where_start = "AND valuation_date >= :start"
+        params["start"] = start_date
+    df = db_utils.query_df(f"""
+        SELECT valuation_date AS date, market_value_eur AS portfolio_eur
+        FROM portfolio_intelligence.entity_daily_valuation
+        WHERE entity_type = 'total' AND valuation_date <= :ref {where_start}
+        ORDER BY valuation_date
+    """, params=params)
+    if df.empty:
+        return df
+    df["date"] = pd.to_datetime(df["date"])
+    return df
+
+
+def get_mctr_top(benchmark_code: str = "MSCI_WORLD", window_days: int = 60, n: int = 8) -> pd.DataFrame:
+    """Groesste Risikobeitraege zum Gesamtportfolio-TE (Marginal Contribution
+    to Tracking Error, Phase 17), absteigend nach |Anteil am Portfolio-TE|."""
+    return db_utils.query_df("""
+        SELECT a.name, m.weight_pct, m.mctr_pct_pa, m.ctr_pct_pa, m.pct_of_total_te
+        FROM portfolio_intelligence.mctr_snapshot m
+        JOIN portfolio_intelligence.benchmark_profile bp ON bp.benchmark_id = m.benchmark_id
+        JOIN portfolio_intelligence.asset a ON a.asset_id = m.mandate_asset_id
+        WHERE bp.code = :code AND m.window_days = :wd
+        ORDER BY ABS(m.pct_of_total_te) DESC
+        LIMIT :n
+    """, params={"code": benchmark_code, "wd": window_days, "n": n})
+
+
 def _ts_at_or_before(ts: pd.Series, target: date) -> float | None:
     """Wert am letzten verfügbaren Datum ≤ target (ts.index = DatetimeIndex)."""
     mask = ts.index <= pd.Timestamp(target)
@@ -943,6 +1064,61 @@ def html_performance_table(
     return f'<table class="data-tbl perf-tbl">\n{rows}</table>'
 
 
+def html_te_table(df: pd.DataFrame) -> str:
+    """Pivotiert auf Zeitfenster-Spalten (20T/60T/252T) je Depot x Benchmark."""
+    if df.empty:
+        return "<p style='color:#94A3B8;font-size:13px'>Keine TE-Daten verfügbar.</p>"
+    piv = df.pivot_table(index=["series_name", "benchmark_code"], columns="window_days",
+                          values="tracking_error_pct", aggfunc="first")
+    rows = _tbl_row("Depot", "Benchmark", "20 Tage", "60 Tage", "252 Tage", header=True)
+    for (name, bench), r in piv.iterrows():
+        rows += _tbl_row(
+            f"<strong>{name}</strong>" if name == "Gesamtportfolio" else name,
+            "MSCI World" if bench == "MSCI_WORLD" else "60/40-Blend",
+            f"{r.get(20, float('nan')):.2f} %" if pd.notna(r.get(20)) else "–",
+            f"{r.get(60, float('nan')):.2f} %" if pd.notna(r.get(60)) else "–",
+            f"{r.get(252, float('nan')):.2f} %" if pd.notna(r.get(252)) else "–",
+        )
+    return f'<table class="data-tbl">\n{rows}</table>'
+
+
+_AMPEL_COLOR = {"red": RED, "yellow": ORANGE, "green": GREEN}
+_AMPEL_LABEL = {"red": "Rot", "yellow": "Gelb", "green": "Grün"}
+
+
+def html_ampel_table(df: pd.DataFrame) -> str:
+    if df.empty:
+        return "<p style='color:#94A3B8;font-size:13px'>Keine Mandate mit gesetztem TE-Limit.</p>"
+    rows = _tbl_row("ETF", "TE (60T)", "Limit", "Auslastung", "Status", header=True)
+    for _, r in df.iterrows():
+        color = _AMPEL_COLOR.get(r["traffic_light"], "#94A3B8")
+        label = _AMPEL_LABEL.get(r["traffic_light"], r["traffic_light"] or "–")
+        dot = f'<span style="display:inline-block;width:9px;height:9px;border-radius:50%;background:{color};margin-right:6px;vertical-align:middle"></span>'
+        rows += _tbl_row(
+            _str_or_dash(r["name"], 45),
+            f"{r['te_pct']:.2f} %" if pd.notna(r["te_pct"]) else "–",
+            f"{r['te_limit_pct']:.1f} %" if pd.notna(r["te_limit_pct"]) else "–",
+            f"{r['utilization_pct']:.0f} %" if pd.notna(r["utilization_pct"]) else "–",
+            f"{dot}{label}",
+        )
+    return f'<table class="data-tbl">\n{rows}</table>'
+
+
+def html_mctr_table(df: pd.DataFrame) -> str:
+    if df.empty:
+        return "<p style='color:#94A3B8;font-size:13px'>Keine MCTR-Daten verfügbar.</p>"
+    rows = _tbl_row("ETF", "Gewicht", "MCTR (p.a.)", "Risikobeitrag", "Anteil am Portfolio-TE", header=True)
+    for _, r in df.iterrows():
+        rows += _tbl_row(
+            _str_or_dash(r["name"], 45),
+            f"{r['weight_pct']:.1f} %",
+            f"{r['mctr_pct_pa']:.2f} %",
+            f"{r['ctr_pct_pa']:.2f} %",
+            f"{r['pct_of_total_te']:.1f} %",
+        )
+    return f'<table class="data-tbl">\n{rows}</table>'
+
+
 # ── Vollständiger HTML-Report ─────────────────────────────────────────────────
 
 CSS = """
@@ -988,78 +1164,85 @@ footer { text-align: center; color: #94A3B8; font-size: 11px; margin-top: 32px;
 
 
 def generate_html(ref_date: date) -> str:
+    """2026-08-17 neu zugeschnitten (Nutzerwunsch): aus dem alten Report bleiben
+    nur Look-Through (Einzeltitel) und der Marktwertverlauf (jetzt 2 Charts,
+    3 Jahre + seit Beginn, aus der vollen Transaktions-Historie statt der alten
+    41-Tage-Snapshot-Quelle). Depot-Pie/-Tabelle, Sektor-/Länder-Allokation und
+    ETF-Überlappung sind bewusst nicht mehr Teil der Ausgabe (Funktionen bleiben
+    im Modul erhalten, falls später wieder gebraucht). Neu: echte TWR-Performance
+    vs. Benchmarks und ein Fachkonzept-Kennzahlen-Abschnitt (TE, TE-Limit-Ampel,
+    MCTR) - siehe "TWR & Fachkonzept-Kennzahlen" weiter oben im Modul."""
     log.info("Lade Daten für %s …", ref_date)
 
-    df_depot   = get_depot_breakdown(ref_date)
-    df_top     = get_top_holdings(ref_date, n=30)
-    df_sector  = get_sector_allocation(ref_date)
-    df_country = get_country_allocation(ref_date)
-    df_overlap = get_etf_overlap(ref_date)
-    cov        = get_coverage(ref_date)
+    df_depot = get_depot_breakdown(ref_date)
+    df_top   = get_top_holdings(ref_date, n=30)
+    cov      = get_coverage(ref_date)
 
     log.info("Gesamtwert: %.2f EUR, Look-Through-Abdeckung: %.1f %%",
              cov["gesamt_eur"], cov["coverage_pct"])
 
-    # Wertentwicklung – zwei separate Zeitreihen:
-    # (1) Perioden-Tabelle: 3 Jahre, ungefiltert (alle ETFs, auch neu hinzugekommene)
-    # (2) YTD-Chart: nur seit Jahresanfang, gefiltert auf ETFs mit Kurs seit Jan 1
-    #     → verhindert Wertsprünge wenn neue ETFs erstmals Kurshistorie bekommen
-    ts_start   = date(ref_date.year - 3, 1, 1)
-    ytd_start  = date(ref_date.year, 1, 1)
-    log.info("Lade Portfolio-Zeitreihe (Perioden, 3J) ab %s …", ts_start)
-    df_port_ts  = get_portfolio_timeseries(ref_date, ts_start, filter_start=False)
-    log.info("Lade Portfolio-Zeitreihe (YTD-Chart, gefiltert) ab %s …", ytd_start)
-    df_port_ts_ytd = get_portfolio_timeseries(ref_date, ytd_start, filter_start=True)
-    log.info("Lade Marktwertverlauf (tatsächliche Stückzahlen) …")
-    df_port_actual = get_portfolio_market_value_actual(ref_date)
-    log.info("Lade Benchmark (%s) …", BENCHMARK_PRIMARY["ticker"])
-    df_bench_ts  = get_benchmark_timeseries(BENCHMARK_PRIMARY["ticker"], ts_start, ref_date)
-    log.info("Lade Misch-Benchmark (%s) …", BENCHMARK_SECONDARY["name"])
-    df_bench_ts2 = get_blended_benchmark_timeseries(BENCHMARK_SECONDARY["weights"], ts_start, ref_date)
-    perf_periods  = calc_period_returns(df_port_ts, df_bench_ts, ref_date)
-    perf_periods2 = calc_period_returns(df_port_ts, df_bench_ts2, ref_date)
+    ts_start  = date(ref_date.year - 3, 1, 1)
+    ytd_start = date(ref_date.year, 1, 1)
 
-    # Depot-KPIs
+    log.info("Lade Marktwertverlauf (3 Jahre + seit Beginn) …")
+    df_value_3y  = get_total_market_value(ts_start, ref_date)
+    df_value_all = get_total_market_value(None, ref_date)
+
+    log.info("Lade TWR (transaktionsbasiert) …")
+    df_twr_idx     = get_twr_index(ts_start, ref_date)
+    df_twr_idx_ytd = get_twr_index(ytd_start, ref_date)
+    df_bench_twr1  = get_benchmark_index_from_intelligence("MSCI_WORLD", ts_start, ref_date)
+    df_bench_twr2  = get_benchmark_index_from_intelligence("60_40_EQUITY_CREDIT", ts_start, ref_date)
+    twr_periods    = calc_period_returns(df_twr_idx, df_bench_twr1, ref_date)
+    twr_periods2   = calc_period_returns(df_twr_idx, df_bench_twr2, ref_date)
+    df_twr_accounts = get_twr_account_summary()
+    twr_by_depot   = dict(zip(df_twr_accounts["account_name"], df_twr_accounts["cumulative_twr_pct"]))
+
+    log.info("Lade Fachkonzept-Kennzahlen (TE, Ampel, MCTR) …")
+    df_te    = get_te_table()
+    df_ampel = get_mandate_ampel_table()
+    df_mctr  = get_mctr_top()
+
+    # Depot-KPIs: EUR-Wert (Snapshot) + echte kumulierte TWR nebeneinander
     depot_summen = df_depot.groupby("depot")["wert_eur"].sum().sort_values(ascending=False)
     gesamt_eur   = depot_summen.sum()
+    gesamt_twr   = float(df_twr_idx["portfolio_eur"].iloc[-1] / 100 - 1) * 100 if not df_twr_idx.empty else None
 
-    # Charts
     log.info("Erstelle Charts …")
-    img_pie   = chart_depot_pie(df_depot)
-    img_top   = chart_top_holdings(df_top, n=20)
-    img_sect  = chart_sector(df_sector)
-    img_value = chart_market_value(df_port_actual)
-    img_perf  = chart_performance(df_port_ts_ytd, [
-        (df_bench_ts,  BENCHMARK_PRIMARY["name"],   ORANGE, "--"),
-        (df_bench_ts2, BENCHMARK_SECONDARY["name"], "#7C3AED", ":"),
+    img_top      = chart_top_holdings(df_top, n=20)
+    img_value_3y  = chart_market_value(df_value_3y)
+    img_value_all = chart_market_value(df_value_all)
+    img_twr = chart_performance(df_twr_idx_ytd, [
+        (df_bench_twr1, BENCHMARK_PRIMARY["name"],   ORANGE, "--"),
+        (df_bench_twr2, BENCHMARK_SECONDARY["name"], "#7C3AED", ":"),
     ], ref_date)
 
-    # KPI-Karten (Depots)
     kpis = ""
     for depot, val in depot_summen.items():
         pct = 100 * val / gesamt_eur if gesamt_eur else 0
+        twr = twr_by_depot.get(depot)
+        twr_sub = f" &nbsp;|&nbsp; TWR {'+' if twr and twr > 0 else ''}{twr:.1f} %" if twr is not None else ""
         kpis += f"""<div class="kpi">
             <div class="val">{_fmt_eur(val)}</div>
             <div class="lbl">{depot}</div>
-            <div class="sub">{_fmt_pct(pct)} des Portfolios</div>
+            <div class="sub">{_fmt_pct(pct)} des Portfolios{twr_sub}</div>
         </div>"""
     kpis += f"""<div class="kpi">
         <div class="val">{_fmt_eur(gesamt_eur)}</div>
         <div class="lbl">Gesamt</div>
-        <div class="sub">Stand: {ref_date.strftime('%d.%m.%Y')}</div>
+        <div class="sub">Stand: {ref_date.strftime('%d.%m.%Y')}{f" &nbsp;|&nbsp; TWR {'+' if gesamt_twr and gesamt_twr > 0 else ''}{gesamt_twr:.1f} %" if gesamt_twr is not None else ""}</div>
     </div>"""
 
-    # Coverage-Bar
     cov_pct   = cov["coverage_pct"]
     cov_color = "#16A34A" if cov_pct >= 80 else "#EA580C" if cov_pct >= 50 else "#DC2626"
 
-    # Top-1 Einzeltitel (für Fließtext)
     top1 = df_top.iloc[0] if not df_top.empty else None
     top1_text = (f"Größtes Einzeltitel-Engagement: <strong>{top1['name']}</strong> "
                  f"mit {_fmt_eur(top1['engagement_eur'])} ({_fmt_pct(top1['anteil_pct'])})."
                  if top1 is not None else "")
 
     ts = datetime.now().strftime("%d.%m.%Y %H:%M Uhr")
+    value_all_start = df_value_all["date"].min().strftime("%d.%m.%Y") if not df_value_all.empty else "–"
 
     html = f"""<!DOCTYPE html>
 <html lang="de">
@@ -1075,38 +1258,50 @@ def generate_html(ref_date: date) -> str:
 <h1>Portfolio-Report</h1>
 <p class="subtitle">Stichtag: {ref_date.strftime('%d. %B %Y')} &nbsp;|&nbsp; Erstellt: {ts}</p>
 
-<div class="warning">
-⚠ Die dargestellte Wertentwicklung zeigt die <strong>Vermögensentwicklung inkl. Einzahlungen</strong>
-– sie ist <em>keine Rendite</em>. Echte Renditezahlen (MWR/TWR) sind erst nach Erfassung der
-Transaktionshistorie möglich.
-</div>
-
-<!-- ── Gesamtwert ── -->
+<!-- ── Gesamtvermögen ── -->
 <h2>Gesamtvermögen</h2>
 <div class="kpi-row">{kpis}</div>
 
+<!-- ── Performance (echte TWR) ── -->
+<h2>Performance (TWR)</h2>
+<p style="color:#64748B;font-size:13px;margin-bottom:12px;">
+Transaktionsbasierte, cashflow-bereinigte Time-Weighted Return (Phase 12/13) –
+echte Rendite, nicht die reine Vermögensentwicklung.
+</p>
+{"<div class='section'><h3>Indexierte Performance vs. Benchmarks (YTD)</h3><img src='data:image/png;base64," + img_twr + "' alt='TWR-Performance-Chart' style='width:100%;max-width:960px'></div>" if img_twr else "<p style='color:#94A3B8;font-size:13px'>Kein TWR-Chart verfügbar.</p>"}
 <div class="section">
-<div class="chart-row">
-    <div><img src="data:image/png;base64,{img_pie}" alt="Depot-Pie" width="400"></div>
-    <div style="flex:1">
-    {html_depot_table(df_depot)}
-    </div>
-</div>
+{html_performance_table(twr_periods, BENCHMARK_PRIMARY["name"], twr_periods2, BENCHMARK_SECONDARY["name"]) if twr_periods else "<p style='color:#94A3B8;font-size:13px'>Keine TWR-Perioden-Daten verfügbar.</p>"}
 </div>
 
-<!-- ── Wertentwicklung ── -->
-<h2>Wertentwicklung</h2>
-
-{"<div class='section'><h3>Marktwertverlauf (absolut, tatsächliche Stückzahlen)</h3><p style='color:#64748B;font-size:12px;margin-bottom:8px'>Je Kurstag die zu diesem Zeitpunkt tatsächlich gehaltenen Stückzahlen (letzter Snapshot ≤ Datum) – Käufe/Verkäufe erscheinen als Stufe. Historie beginnt am ältesten Snapshot (" + df_port_actual['date'].min().strftime('%d.%m.%Y') + ") und verlängert sich mit jedem weiteren monatlichen Snapshot.</p><img src='data:image/png;base64," + img_value + "' alt='Marktwertverlauf' style='width:100%;max-width:960px'></div>" if img_value else "<p style='color:#94A3B8;font-size:13px'>Kein Marktwertverlauf (noch kein position_snapshot vorhanden).</p>"}
-
-<div class="warning" style="margin-bottom:12px">
-⚠ <strong>Hypothetische Entwicklung</strong> (nachfolgender Chart und Tabelle) – konstante
-Stückzahlen des letzten Snapshots rückwirkend angewendet, keine Cashflow-Bereinigung.
-Kein Vergleich zur echten Rendite möglich.
-</div>
-{"<div class='section'><h3>Indexierte Performance vs. Benchmarks (YTD)</h3><img src='data:image/png;base64," + img_perf + "' alt='Performance-Chart' style='width:100%;max-width:960px'></div>" if img_perf else "<p style='color:#94A3B8;font-size:13px'>Kein YTD-Chart (Kursdaten fehlen – bitte <code>python load_prices.py --since " + str(date(ref_date.year, 1, 1)) + "</code> ausführen).</p>"}
+<!-- ── Marktwertverlauf ── -->
+<h2>Marktwertverlauf Gesamtdepot</h2>
 <div class="section">
-{html_performance_table(perf_periods, BENCHMARK_PRIMARY["name"], perf_periods2, BENCHMARK_SECONDARY["name"]) if perf_periods else "<p style='color:#94A3B8;font-size:13px'>Keine Perioden-Daten verfügbar.</p>"}
+<h3>Letzte 3 Jahre</h3>
+{"<img src='data:image/png;base64," + img_value_3y + "' alt='Marktwertverlauf 3 Jahre' style='width:100%;max-width:960px'>" if img_value_3y else "<p style='color:#94A3B8;font-size:13px'>Keine Daten.</p>"}
+</div>
+<div class="section">
+<h3>Seit Beginn ({value_all_start})</h3>
+{"<img src='data:image/png;base64," + img_value_all + "' alt='Marktwertverlauf seit Beginn' style='width:100%;max-width:960px'>" if img_value_all else "<p style='color:#94A3B8;font-size:13px'>Keine Daten.</p>"}
+</div>
+
+<!-- ── Fachkonzept-Kennzahlen ── -->
+<h2>Risikokennzahlen (Fachkonzept)</h2>
+<p style="color:#64748B;font-size:13px;margin-bottom:12px;">
+Tracking Error je Depot/Gesamt vs. beide Policy-Benchmarks (MSCI World, 60/40-Blend),
+TE-Limit-Auslastung je Mandat und die größten Risikobeiträge zum Gesamtportfolio-TE
+(Marginal Contribution to Tracking Error, Ledoit-Wolf-Kovarianzschätzung).
+</p>
+<div class="section">
+<h3>Tracking Error</h3>
+{html_te_table(df_te)}
+</div>
+<div class="section">
+<h3>TE-Limit-Auslastung je Mandat (60 Tage, ggü. MSCI World)</h3>
+{html_ampel_table(df_ampel)}
+</div>
+<div class="section">
+<h3>Größte Risikobeiträge (MCTR, 60 Tage, ggü. MSCI World)</h3>
+{html_mctr_table(df_mctr)}
 </div>
 
 <!-- ── Look-Through ── -->
@@ -1128,33 +1323,10 @@ Effektives Engagement addiert über alle ETFs und Depots hinweg (Kurs × Stückz
 {html_top_holdings(df_top)}
 </div>
 
-<!-- ── Sektor und Land ── -->
-<h2>Allokation (Look-Through)</h2>
-<div class="section">
-<div class="chart-row">
-    <div style="flex:2">
-        <img src="data:image/png;base64,{img_sect}" alt="Sektor" style="width:100%">
-    </div>
-    <div style="flex:1">
-        <h3>Länder-Allokation (Top 15)</h3>
-        {html_country(df_country)}
-    </div>
-</div>
-</div>
-
-<!-- ── ETF-Überlappung ── -->
-<h2>ETF-Überlappung (Redundanz)</h2>
-<p style="color:#64748B;font-size:13px;margin-bottom:12px;">
-Paarweise Gewichts-Überschneidung: Σ min(Gewicht_A, Gewicht_B) über alle gemeinsamen Titel.
-Hohe Überlappung bedeutet Redundanz zwischen zwei ETFs.
-</p>
-<div class="section">
-{html_overlap(df_overlap)}
-</div>
-
 <footer>
-Datenquellen: yfinance (Kurse), iShares/Xtrackers/Amundi/L&G/SPDR/VanEck/Vanguard (Holdings),
-OpenFIGI (ISIN-Auflösung). &nbsp;|&nbsp; Kein Anlageratschlag.
+Datenquellen: portfolio_intelligence (TWR/TE/NormRt/MCTR, transaktionsbasiert), yfinance (Kurse),
+iShares/Xtrackers/Amundi/L&G/SPDR/VanEck/Vanguard (Holdings), OpenFIGI (ISIN-Auflösung).
+&nbsp;|&nbsp; Kein Anlageratschlag.
 </footer>
 
 </div>

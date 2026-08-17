@@ -1,25 +1,33 @@
 """Diagnose-Report per E-Mail (Server-Cronjob) - DB-Gesundheitscheck.
 
-Laeuft NACH dem vollen Batch-Stack (siehe run_pipeline.py im Root-Ordner),
-VOR dem eigentlichen Portfolio-Report (etf_tracker_send_report.py). Eigene,
-erste Mail - Nutzerwunsch 2026-08-17: "der diagnose report soll als erste
-mail raus dann der rest getrennt".
+Laeuft NACH dem vollen Batch-Stack (siehe run_pipeline.py), VOR dem
+eigentlichen Portfolio-Report (etf_tracker_send_report.py). Eigene, erste
+Mail - Nutzerwunsch 2026-08-17: "der diagnose report soll als erste mail
+raus dann der rest getrennt".
 
 Prueft genau die Fehlerklassen, die in der PoC-Session 2026-08-16/17
 tatsaechlich reale Bugs waren (siehe portfolio_intelligence.design_log):
   1. Pipeline-Frische je Tabelle - faengt "Phase X wurde nicht neu
-     gerechnet"-Bugs (genau das ist heute zweimal passiert: Preis-Fix ohne
-     Downstream-Rerun, phase10 vor statt nach phase12/13).
+     gerechnet"-Bugs (genau das ist am 2026-08-17 zweimal passiert:
+     Preis-Fix ohne Downstream-Rerun, phase10 vor statt nach phase12/13).
   2. Neue Kurs-Anomalien (v_dashboard_price_anomaly) - faengt Bad Ticks wie
      den 2025-10-24-Fall.
   3. NormRt-Konsistenz (Budget = Real * Auslastung) - Formel-Regression.
   4. MCTR-Euler-Konsistenz (Summe CTR = TE_Portfolio) - Formel-Regression.
   5. Offene design_log-Eintraege (status='open') - Erinnerung an bekannte
-     Luecken (aktuell: 41-Tage-Datenlimit auf Mandats-Ebene).
+     Luecken.
 
 Kein Ersatz fuer den Portfolio-Performance-Report (TWR/Fachkonzept-Kennzahlen
 - separates Projekt des Nutzers in generate_report.py). Rein technischer
-Zustand der Datenbank.
+Zustand der Datenbank - gedacht als taegliches Scan-Dokument, nicht zum
+Studieren: Ampel-Zusammenfassung oben, Details darunter, unauffaellige
+Karten wenn ein Check gruen ist.
+
+HTML-Design bewusst e-mail-sicher: nur Inline-Styles + Tabellen-Layout
+(kein <style>-Block, den z.B. Outlook Desktop haeufig entfernt), System-
+Schriftstapel (kein @font-face - E-Mail-Clients laden keine eingebetteten
+Fonts zuverlaessig), keine CSS-Variablen (fehlende Unterstuetzung in
+aelteren Clients).
 """
 
 from __future__ import annotations
@@ -55,35 +63,77 @@ from mail_utils import send_mail
 # Pipeline-Schritt zuverlaessig ab.
 FRESHNESS_LAG_TOLERANCE_DAYS = 3
 
+# ============================================================
+# Design tokens (E-Mail-sicher: Inline-Styles, keine CSS-Variablen)
+# ============================================================
+INK = "#1c2430"
+MUTED = "#66707e"
+FAINT = "#9aa3b2"
+BORDER = "#dde1e8"
+CARD_BG = "#ffffff"
+PAGE_BG = "#eef1f5"
+ACCENT = "#1f3a5f"
+ACCENT_SOFT = "#e8edf4"
+
+STATUS = {
+    "OK":    {"fg": "#0f7a4d", "bg": "#e5f5ee", "label": "OK"},
+    "WARN":  {"fg": "#b6650a", "bg": "#fdf1e0", "label": "WARNUNG"},
+    "ERROR": {"fg": "#c0342c", "bg": "#fceaea", "label": "FEHLER"},
+    "INFO":  {"fg": "#51607a", "bg": "#eef0f5", "label": "INFO"},
+}
+SEVERITY_ORDER = {"ERROR": 0, "WARN": 1, "INFO": 2, "OK": 3}
+
+FONT_UI = "-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif"
+FONT_MONO = "'SFMono-Regular',Consolas,'Liberation Mono',Menlo,monospace"
+
+
+def _pill(status: str) -> str:
+    s = STATUS[status]
+    return (
+        f"<span style=\"display:inline-block;font-family:{FONT_UI};font-size:11px;"
+        f"font-weight:600;letter-spacing:.04em;text-transform:uppercase;"
+        f"color:{s['fg']};background:{s['bg']};border-radius:4px;"
+        f"padding:3px 8px;line-height:1.4\">{s['label']}</span>"
+    )
+
+
+# ============================================================
+# Checks
+# ============================================================
 
 def _check_pipeline_freshness() -> tuple[str, list[dict]]:
     """MAX(Datum) je Kernquelle - alles muss nah beieinander liegen. Fing
-    heute genau den Bug, dass account_twr/total_twr nach phase12/13 auf
-    altem Datum haengen blieben, waehrend mandate/account/total weiterliefen."""
+    am 2026-08-17 genau den Bug, dass account_twr/total_twr nach
+    phase12/13 auf altem Datum haengen blieben, waehrend mandate/account/
+    total weiterliefen."""
     df = db_utils.query_df(
         """
-        SELECT 'asset_daily_return' AS source, MAX(return_date) AS max_date
+        SELECT 'Kurse/Renditen (asset_daily_return)' AS source, MAX(return_date) AS max_date
             FROM portfolio_intelligence.asset_daily_return
         UNION ALL
-        SELECT 'entity_daily_valuation (mandate/account/total)', MAX(valuation_date)
+        SELECT 'Mandats-/Depot-Bewertung (entity_daily_valuation)', MAX(valuation_date)
             FROM portfolio_intelligence.entity_daily_valuation
         UNION ALL
-        SELECT 'twr_daily_total (Gesamtportfolio, transaktionsbasiert)', MAX(valuation_date)
+        SELECT 'Gesamtdepot-TWR (twr_daily_total)', MAX(valuation_date)
             FROM portfolio_intelligence.twr_daily_total
         UNION ALL
-        SELECT 'tracking_error_rolling (mandate/account/total)', MAX(calc_date)
+        SELECT 'Tracking Error (Mandat/Depot/Gesamt)', MAX(calc_date)
             FROM portfolio_intelligence.tracking_error_rolling WHERE entity_type IN ('mandate','account','total')
         UNION ALL
-        SELECT 'tracking_error_rolling (account_twr/total_twr)', MAX(calc_date)
+        SELECT 'Tracking Error (TWR-basiert)', MAX(calc_date)
             FROM portfolio_intelligence.tracking_error_rolling WHERE entity_type IN ('account_twr','total_twr')
         UNION ALL
-        SELECT 'mctr_snapshot', MAX(calc_date) FROM portfolio_intelligence.mctr_snapshot
+        SELECT 'MCTR-Snapshot', MAX(calc_date) FROM portfolio_intelligence.mctr_snapshot
         """
     )
     max_overall = df["max_date"].max()
     df["lag_days"] = df["max_date"].apply(lambda d: (max_overall - d).days if d is not None else None)
     status = "ERROR" if df["lag_days"].apply(lambda x: x is None or x > FRESHNESS_LAG_TOLERANCE_DAYS).any() else "OK"
-    return status, df.to_dict("records")
+    rows = [
+        {"Quelle": r["source"], "Letzter Stand": r["max_date"], "Rueckstand": f"{int(r['lag_days'])} Tage" if r["lag_days"] else "aktuell"}
+        for r in df.to_dict("records")
+    ]
+    return status, rows
 
 
 def _check_new_price_anomalies() -> tuple[str, list[dict]]:
@@ -92,26 +142,51 @@ def _check_new_price_anomalies() -> tuple[str, list[dict]]:
     jedes Mal neu gemeldet, nur frische."""
     df = db_utils.query_df(
         """
-        SELECT legacy_isin, name, return_date, daily_return_pct, z_score
+        SELECT legacy_isin, name, return_date, ROUND(daily_return_pct::numeric, 2) AS daily_return_pct,
+               ROUND(z_score::numeric, 1) AS z_score
         FROM portfolio_intelligence.v_dashboard_price_anomaly
         WHERE return_date >= CURRENT_DATE - INTERVAL '7 days'
         ORDER BY return_date DESC
         """
     )
     status = "WARN" if not df.empty else "OK"
-    return status, df.to_dict("records")
+    rows = [
+        {"ISIN": r["legacy_isin"], "Name": r["name"], "Datum": r["return_date"],
+         "Tagesrendite": f"{r['daily_return_pct']:+.2f} %", "Z-Score": r["z_score"]}
+        for r in df.to_dict("records")
+    ]
+    return status, rows
+
+
+def _resolve_entity_name_sql(alias: str) -> str:
+    """SQL-Ausdruck, der entity_type/entity_id auf einen lesbaren Namen
+    aufloest (Mandat=ETF-Name, Depot=Kontoname, Gesamt=fester Text)."""
+    return f"""
+        CASE
+            WHEN {alias}.entity_type = 'mandate' THEN a.name
+            WHEN {alias}.entity_type IN ('account','account_twr') THEN av.account_name
+            ELSE 'Gesamtportfolio'
+        END
+    """
 
 
 def _check_normrt_consistency() -> tuple[str, list[dict]]:
+    name_expr = _resolve_entity_name_sql("ter")
     df = db_utils.query_df(
-        """
-        SELECT entity_type, entity_id, benchmark_id, window_days,
-               norm_return_budget, norm_return_real, utilization_pct,
-               ABS(norm_return_budget - norm_return_real * utilization_pct / 100.0) AS diff
-        FROM portfolio_intelligence.tracking_error_rolling
-        WHERE norm_return_budget IS NOT NULL AND norm_return_real IS NOT NULL
-          AND utilization_pct IS NOT NULL
-          AND calc_date = (SELECT MAX(calc_date) FROM portfolio_intelligence.tracking_error_rolling)
+        f"""
+        SELECT {name_expr} AS name, bp.code AS benchmark, ter.window_days,
+               ROUND(ter.norm_return_budget::numeric, 3) AS norm_return_budget,
+               ROUND(ter.norm_return_real::numeric, 3) AS norm_return_real,
+               ROUND(ter.utilization_pct::numeric, 0) AS utilization_pct,
+               ABS(ter.norm_return_budget - ter.norm_return_real * ter.utilization_pct / 100.0) AS diff
+        FROM portfolio_intelligence.tracking_error_rolling ter
+        LEFT JOIN portfolio_intelligence.etf_mandate em ON ter.entity_type = 'mandate' AND em.mandate_id = ter.entity_id
+        LEFT JOIN portfolio_intelligence.asset a ON a.asset_id = em.asset_id
+        LEFT JOIN portfolio_intelligence.account_view av ON ter.entity_type IN ('account','account_twr') AND av.account_view_id = ter.entity_id
+        JOIN portfolio_intelligence.benchmark_profile bp ON bp.benchmark_id = ter.benchmark_id
+        WHERE ter.norm_return_budget IS NOT NULL AND ter.norm_return_real IS NOT NULL
+          AND ter.utilization_pct IS NOT NULL
+          AND ter.calc_date = (SELECT MAX(calc_date) FROM portfolio_intelligence.tracking_error_rolling)
         ORDER BY diff DESC
         LIMIT 5
         """
@@ -119,52 +194,113 @@ def _check_normrt_consistency() -> tuple[str, list[dict]]:
     if df.empty:
         return "OK", []
     status = "ERROR" if float(df["diff"].max()) > 0.05 else "OK"
-    return status, df.to_dict("records")
+    rows = [
+        {"Position": r["name"], "Benchmark": r["benchmark"], "Fenster": f"{r['window_days']}T",
+         "NormRt Budget": r["norm_return_budget"], "NormRt Real": r["norm_return_real"],
+         "Auslastung": f"{r['utilization_pct']:.0f} %", "Abweichung": f"{r['diff']:.5f}"}
+        for r in df.to_dict("records")
+    ]
+    return status, rows
 
 
 def _check_mctr_euler_consistency() -> tuple[str, list[dict]]:
     df = db_utils.query_df(
         """
-        SELECT calc_date, benchmark_id, window_days,
-               SUM(ctr_pct_pa) AS sum_ctr, MAX(portfolio_te_pct_pa) AS te_p,
-               ABS(SUM(ctr_pct_pa) - MAX(portfolio_te_pct_pa)) AS diff
-        FROM portfolio_intelligence.mctr_snapshot
-        GROUP BY calc_date, benchmark_id, window_days
+        SELECT m.calc_date, bp.code AS benchmark, m.window_days,
+               ROUND(SUM(m.ctr_pct_pa)::numeric, 4) AS sum_ctr,
+               ROUND(MAX(m.portfolio_te_pct_pa)::numeric, 4) AS te_p,
+               ABS(SUM(m.ctr_pct_pa) - MAX(m.portfolio_te_pct_pa)) AS diff
+        FROM portfolio_intelligence.mctr_snapshot m
+        JOIN portfolio_intelligence.benchmark_profile bp ON bp.benchmark_id = m.benchmark_id
+        GROUP BY m.calc_date, bp.code, m.window_days
         ORDER BY diff DESC
         """
     )
     if df.empty:
         return "WARN", []
     status = "ERROR" if float(df["diff"].max()) > 0.05 else "OK"
-    return status, df.to_dict("records")
+    rows = [
+        {"Datum": r["calc_date"], "Benchmark": r["benchmark"], "Fenster": f"{r['window_days']}T",
+         "Sum(CTR)": r["sum_ctr"], "TE Portfolio": r["te_p"], "Abweichung": f"{r['diff']:.5f}"}
+        for r in df.to_dict("records")
+    ]
+    return status, rows
 
 
 def _check_open_design_log() -> tuple[str, list[dict]]:
     df = db_utils.query_df(
         """
-        SELECT logged_date, area, title, decision
+        SELECT logged_date, area, title
         FROM portfolio_intelligence.design_log
         WHERE status = 'open'
         ORDER BY logged_date DESC
         """
     )
-    return "INFO", df.to_dict("records")
+    rows = [{"Datum": r["logged_date"], "Bereich": r["area"], "Punkt": r["title"]} for r in df.to_dict("records")]
+    return "INFO", rows
 
 
-def _fmt_table(rows: list[dict]) -> str:
+# ============================================================
+# HTML-Rendering (Tabellen-Layout, Inline-Styles - e-mail-sicher)
+# ============================================================
+
+_NUMERIC_HINT = ("Fenster", "Budget", "Real", "Auslastung", "Abweichung", "CTR", "TE ", "Z-Score", "Tagesrendite", "Rueckstand")
+
+
+def _is_numeric_col(col: str) -> bool:
+    return any(h in col for h in _NUMERIC_HINT)
+
+
+def _table_html(rows: list[dict]) -> str:
     if not rows:
-        return "<p style='color:#666'>Keine Zeilen.</p>"
+        return (
+            f"<p style=\"margin:0;font-family:{FONT_UI};font-size:13px;color:{MUTED}\">"
+            f"Keine Auffaelligkeiten.</p>"
+        )
     cols = list(rows[0].keys())
-    head = "".join(f"<th style='text-align:left;padding:4px 8px;border-bottom:1px solid #ccc'>{c}</th>" for c in cols)
+    head_cells = "".join(
+        f"<th style=\"text-align:{'right' if _is_numeric_col(c) else 'left'};padding:6px 10px;"
+        f"font-family:{FONT_UI};font-size:11px;font-weight:600;letter-spacing:.03em;"
+        f"text-transform:uppercase;color:{FAINT};border-bottom:1px solid {BORDER}\">{c}</th>"
+        for c in cols
+    )
     body_rows = []
     for r in rows[:20]:
-        cells = "".join(f"<td style='padding:4px 8px;border-bottom:1px solid #eee'>{r[c]}</td>" for c in cols)
+        cells = "".join(
+            f"<td style=\"text-align:{'right' if _is_numeric_col(c) else 'left'};padding:6px 10px;"
+            f"font-family:{FONT_MONO if _is_numeric_col(c) else FONT_UI};font-size:12.5px;"
+            f"color:{INK};border-bottom:1px solid {BORDER}\">{r[c]}</td>"
+            for c in cols
+        )
         body_rows.append(f"<tr>{cells}</tr>")
-    more = f"<p style='color:#666'>... und {len(rows) - 20} weitere Zeilen.</p>" if len(rows) > 20 else ""
-    return f"<table style='border-collapse:collapse;font-size:13px'><tr>{head}</tr>{''.join(body_rows)}</table>{more}"
+    more = (
+        f"<p style=\"margin:8px 0 0;font-family:{FONT_UI};font-size:12px;color:{FAINT}\">"
+        f"... und {len(rows) - 20} weitere Zeilen.</p>" if len(rows) > 20 else ""
+    )
+    return (
+        f"<table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" "
+        f"style=\"border-collapse:collapse;width:100%\"><tr>{head_cells}</tr>{''.join(body_rows)}</table>{more}"
+    )
 
 
-_STATUS_COLOR = {"OK": "#2e7d32", "WARN": "#e65100", "ERROR": "#c62828", "INFO": "#555"}
+def _card(title: str, status: str, rows: list[dict]) -> str:
+    s = STATUS[status]
+    return f"""
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;margin:0 0 16px">
+      <tr>
+        <td style="background:{CARD_BG};border:1px solid {BORDER};border-left:3px solid {s['fg']};
+                   border-radius:6px;padding:16px 18px">
+          <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;margin-bottom:10px">
+            <tr>
+              <td style="font-family:{FONT_UI};font-size:14px;font-weight:600;color:{INK}">{title}</td>
+              <td align="right">{_pill(status)}</td>
+            </tr>
+          </table>
+          {_table_html(rows)}
+        </td>
+      </tr>
+    </table>
+    """
 
 
 def build_report_html() -> tuple[str, str]:
@@ -173,29 +309,55 @@ def build_report_html() -> tuple[str, str]:
         ("Pipeline-Frische", _check_pipeline_freshness()),
         ("Neue Kurs-Anomalien (letzte 7 Tage)", _check_new_price_anomalies()),
         ("NormRt-Konsistenz (Budget = Real x Auslastung)", _check_normrt_consistency()),
-        ("MCTR-Euler-Konsistenz (Summe CTR = TE_Portfolio)", _check_mctr_euler_consistency()),
-        ("Offene Design-Log-Punkte", _check_open_design_log()),
+        ("MCTR-Konsistenz (Summe Risikobeitraege = Portfolio-TE)", _check_mctr_euler_consistency()),
+        ("Offene Punkte (design_log)", _check_open_design_log()),
     ]
 
-    severity_order = {"ERROR": 0, "WARN": 1, "INFO": 2, "OK": 3}
-    overall = min((s for _, (s, _) in checks), key=lambda s: severity_order[s])
+    overall = min((s for _, (s, _) in checks), key=lambda s: SEVERITY_ORDER[s])
+    counts: dict[str, int] = {}
+    for _, (s, _) in checks:
+        counts[s] = counts.get(s, 0) + 1
+    summary_bits = " · ".join(f"{n} {STATUS[s]['label'].title()}" for s, n in sorted(counts.items(), key=lambda kv: SEVERITY_ORDER[kv[0]]))
 
-    sections = []
-    for title, (status, rows) in checks:
-        color = _STATUS_COLOR[status]
-        sections.append(
-            f"<h3 style='margin-bottom:4px'>{title} "
-            f"<span style='color:{color};font-size:13px'>[{status}]</span></h3>"
-            f"{_fmt_table(rows)}"
-        )
+    cards = "".join(_card(title, status, rows) for title, (status, rows) in checks)
+    weekday_de = ["Montag", "Dienstag", "Mittwoch", "Donnerstag", "Freitag", "Samstag", "Sonntag"][date.today().weekday()]
+    today_label = f"{weekday_de}, {date.today().strftime('%d.%m.%Y')}"
 
     html = f"""
-    <html><body style="font-family:Arial,sans-serif;color:#222">
-    <h2>Diagnose-Report {date.today().isoformat()}</h2>
-    <p>Automatischer DB-Gesundheitscheck nach dem Batch-Lauf (portfolio_intelligence-Stack).
-    Kein Performance-Report - siehe separate Mail dafuer.</p>
-    {''.join(sections)}
-    </body></html>
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;background:{PAGE_BG};padding:24px 0">
+      <tr>
+        <td align="center">
+          <table role="presentation" width="600" cellpadding="0" cellspacing="0" style="border-collapse:collapse;width:600px;max-width:100%">
+            <tr>
+              <td style="background:{ACCENT};border-radius:8px 8px 0 0;padding:22px 24px">
+                <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse">
+                  <tr>
+                    <td style="font-family:{FONT_UI};color:#ffffff">
+                      <div style="font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:{ACCENT_SOFT};opacity:.85">Diagnose-Report</div>
+                      <div style="font-size:20px;font-weight:600;margin-top:2px">{today_label}</div>
+                    </td>
+                    <td align="right">{_pill(overall)}</td>
+                  </tr>
+                </table>
+              </td>
+            </tr>
+            <tr>
+              <td style="background:{CARD_BG};padding:12px 24px;border-left:1px solid {BORDER};border-right:1px solid {BORDER}">
+                <p style="margin:0;font-family:{FONT_UI};font-size:13px;color:{MUTED}">
+                  {summary_bits} &middot; automatischer DB-Gesundheitscheck des portfolio_intelligence-Stacks,
+                  kein Performance-Report (siehe separate Mail dafuer).
+                </p>
+              </td>
+            </tr>
+            <tr>
+              <td style="padding:20px 24px 4px;border-left:1px solid {BORDER};border-right:1px solid {BORDER};border-bottom:1px solid {BORDER};border-radius:0 0 8px 8px">
+                {cards}
+              </td>
+            </tr>
+          </table>
+        </td>
+      </tr>
+    </table>
     """
     return html, overall
 
