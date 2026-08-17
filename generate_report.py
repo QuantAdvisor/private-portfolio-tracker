@@ -666,6 +666,45 @@ def get_twr_account_summary() -> pd.DataFrame:
     """)
 
 
+def get_portfolio_efficiency() -> pd.DataFrame:
+    """Rendite p.a. (geometrisch annualisiert aus der TWR) und Vola p.a.
+    (Stdabw. der taeglichen TWR-Teilperiodenrenditen x sqrt(252)) je Depot
+    und Gesamt - 'Effizienz' der Portfolien, Nutzerwunsch 2026-08-17."""
+    return db_utils.query_df("""
+        WITH per_account AS (
+            SELECT av.account_name AS name, td.valuation_date, td.subperiod_return_pct, td.cumulative_twr_pct
+            FROM portfolio_intelligence.twr_daily td
+            JOIN portfolio_intelligence.account_view av ON av.account_view_id = td.account_view_id
+        ),
+        total AS (
+            SELECT 'Gesamtportfolio' AS name, tdt.valuation_date, tdt.subperiod_return_pct, tdt.cumulative_twr_pct
+            FROM portfolio_intelligence.twr_daily_total tdt
+        ),
+        combined AS (
+            SELECT * FROM per_account
+            UNION ALL
+            SELECT * FROM total
+        ),
+        agg AS (
+            SELECT
+                name,
+                MIN(valuation_date) AS start_date,
+                MAX(valuation_date) AS end_date,
+                COUNT(subperiod_return_pct) AS n_obs,
+                STDDEV_SAMP(subperiod_return_pct) AS daily_vol_pct,
+                (ARRAY_AGG(cumulative_twr_pct ORDER BY valuation_date DESC))[1] AS cum_return_pct
+            FROM combined
+            GROUP BY name
+        )
+        SELECT
+            name, start_date, end_date, n_obs, cum_return_pct::float AS cum_return_pct,
+            ((POWER(1 + cum_return_pct / 100.0, 252.0 / NULLIF(n_obs, 0)) - 1) * 100)::float AS return_pa_pct,
+            (daily_vol_pct * SQRT(252))::float AS vol_pa_pct
+        FROM agg
+        ORDER BY CASE WHEN name = 'Gesamtportfolio' THEN 0 ELSE 1 END, name
+    """)
+
+
 def get_te_table() -> pd.DataFrame:
     """Tracking Error je Depot/Gesamt vs. beide Policy-Benchmarks, 3 Fenster -
     direkt aus der Dashboard-View, keine eigene Logik noetig."""
@@ -1064,6 +1103,23 @@ def html_performance_table(
     return f'<table class="data-tbl perf-tbl">\n{rows}</table>'
 
 
+def html_efficiency_table(df: pd.DataFrame) -> str:
+    if df.empty:
+        return "<p style='color:#94A3B8;font-size:13px'>Keine TWR-Daten verfügbar.</p>"
+    rows = _tbl_row("Depot", "Zeitraum", "Rendite p.a.", "Vola p.a.", "Rendite/Vola", header=True)
+    for _, r in df.iterrows():
+        ratio = r["return_pa_pct"] / r["vol_pa_pct"] if r["vol_pa_pct"] else None
+        name_cell = f"<strong>{r['name']}</strong>" if r["name"] == "Gesamtportfolio" else r["name"]
+        rows += _tbl_row(
+            name_cell,
+            f"{r['start_date'].strftime('%d.%m.%y')}–{r['end_date'].strftime('%d.%m.%y')}",
+            f"{'+' if r['return_pa_pct'] >= 0 else ''}{r['return_pa_pct']:.1f} %",
+            f"{r['vol_pa_pct']:.1f} %",
+            f"{ratio:.2f}" if ratio is not None else "–",
+        )
+    return f'<table class="data-tbl">\n{rows}</table>'
+
+
 def html_te_table(df: pd.DataFrame) -> str:
     """Pivotiert auf Zeitfenster-Spalten (20T/60T/252T) je Depot x Benchmark."""
     if df.empty:
@@ -1200,6 +1256,7 @@ def generate_html(ref_date: date) -> str:
     twr_periods2   = calc_period_returns(df_twr_idx, df_bench_twr2, ref_date)
     df_twr_accounts = get_twr_account_summary()
     twr_by_depot   = dict(zip(df_twr_accounts["account_name"], df_twr_accounts["cumulative_twr_pct"]))
+    df_efficiency  = get_portfolio_efficiency()
 
     log.info("Lade Fachkonzept-Kennzahlen (TE, Ampel, MCTR) …")
     df_te    = get_te_table()
@@ -1275,6 +1332,18 @@ echte Rendite, nicht die reine Vermögensentwicklung.
 {"<div class='section'><h3>Indexierte Performance vs. Benchmarks (YTD)</h3><img src='data:image/png;base64," + img_twr + "' alt='TWR-Performance-Chart' style='width:100%;max-width:960px'></div>" if img_twr else "<p style='color:#94A3B8;font-size:13px'>Kein TWR-Chart verfügbar.</p>"}
 <div class="section">
 {html_performance_table(twr_periods, BENCHMARK_PRIMARY["name"], twr_periods2, BENCHMARK_SECONDARY["name"]) if twr_periods else "<p style='color:#94A3B8;font-size:13px'>Keine TWR-Perioden-Daten verfügbar.</p>"}
+</div>
+
+<!-- ── Effizienz ── -->
+<h2>Effizienz der Portfolien</h2>
+<p style="color:#64748B;font-size:13px;margin-bottom:12px;">
+Annualisierte Rendite (geometrisch aus der TWR) und annualisierte Volatilität
+(Stdabw. der täglichen TWR-Teilperiodenrenditen) je Depot und Gesamt.
+Rendite/Vola als grobes Effizienzmaß (kein Sharpe Ratio – kein risikofreier
+Zins abgezogen).
+</p>
+<div class="section">
+{html_efficiency_table(df_efficiency)}
 </div>
 
 <!-- ── Marktwertverlauf ── -->
