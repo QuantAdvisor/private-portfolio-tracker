@@ -174,6 +174,18 @@ def _check_pipeline_freshness() -> tuple[str, list[dict]]:
     return status, rows
 
 
+def is_pipeline_current() -> bool:
+    """True nur wenn der Stack absolut aktuell ist (0 Handelstage Rueckstand,
+    siehe _check_pipeline_freshness). Von run_pipeline.py genutzt (Import aus
+    private-portfolio-tracker, Nutzerwunsch 2026-08-19), um den Portfolio-
+    Performance-Report (etf_tracker_send_report.py) nur bei aktuellen Daten
+    zu verschicken - bei mehreren Laeufen pro Tag (06/12/16 Uhr) soll ein
+    eingefrorener Stack (z.B. der Yahoo-NaN-Close-Fall vom 2026-08-19) nicht
+    denselben veralteten Report mehrfach rausschicken."""
+    status, _ = _check_pipeline_freshness()
+    return status == "OK"
+
+
 def _check_new_price_anomalies() -> tuple[str, list[dict]]:
     """v_dashboard_price_anomaly-Treffer der letzten 7 Tage - alte, bereits
     bekannte Ausreisser (z.B. COVID-Crash) sind normal und werden nicht
