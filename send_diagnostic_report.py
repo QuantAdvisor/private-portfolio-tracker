@@ -35,7 +35,7 @@ from __future__ import annotations
 import logging
 import sys
 import traceback
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -62,6 +62,23 @@ from mail_utils import send_mail
 # normale Wochenend-/Feiertagsluecken, faengt aber einen ausgebliebenen
 # Pipeline-Schritt zuverlaessig ab.
 FRESHNESS_LAG_TOLERANCE_DAYS = 3
+
+# Absoluter Freshness-Check gegen CURRENT_DATE: 0 Toleranz-Tage ueber dem
+# letzten erwarteten Handelstag (Mo-Fr vor heute) gilt als OK, 1 Tag als WARN
+# (deckt einen einzelnen Boersenfeiertag ab, ohne stumm zu bleiben), mehr als
+# 1 Tag als ERROR. Bewusst eng - eine lockerere Toleranz (z.B. 3 wie beim
+# Quellen-untereinander-Vergleich oben) haette genau den 2026-08-19-Fall
+# (Stack haengt 1 Handelstag hinter Yahoo's fehlender Close-Notierung fuer
+# europaeische Boersen) wieder unter den Tisch fallen lassen.
+
+
+def _last_expected_business_day(today: date) -> date:
+    """Letzter Mo-Fr vor heute (keine Feiertagsliste - dafuer ist die
+    ABSOLUTE_FRESHNESS_TOLERANCE_DAYS-Toleranz oben gedacht)."""
+    prior = today - timedelta(days=1)
+    while prior.weekday() >= 5:  # Sa=5, So=6
+        prior -= timedelta(days=1)
+    return prior
 
 # ============================================================
 # Design tokens (E-Mail-sicher: Inline-Styles, keine CSS-Variablen)
@@ -102,10 +119,17 @@ def _pill(status: str) -> str:
 # ============================================================
 
 def _check_pipeline_freshness() -> tuple[str, list[dict]]:
-    """MAX(Datum) je Kernquelle - alles muss nah beieinander liegen. Fing
-    am 2026-08-17 genau den Bug, dass account_twr/total_twr nach
+    """MAX(Datum) je Kernquelle - alles muss nah beieinander liegen UND nah an
+    heute. Fing am 2026-08-17 genau den Bug, dass account_twr/total_twr nach
     phase12/13 auf altem Datum haengen blieben, waehrend mandate/account/
-    total weiterliefen."""
+    total weiterliefen.
+
+    Der reine Quellen-untereinander-Vergleich (lag_days) reicht nicht: friert
+    der GESAMTE Stack gemeinsam ein (z.B. weil load_prices.py wegen einer
+    fehlenden Yahoo-Close-Notierung nie ueber ein Datum hinauskommt, siehe
+    design_log 2026-08-19), bleibt der relative Abstand zwischen den Quellen
+    bei 0 - die Ampel waere gruen, obwohl alles tagealt ist. Deshalb
+    zusaetzlich max_overall gegen CURRENT_DATE pruefen (today_lag_days)."""
     df = db_utils.query_df(
         """
         SELECT 'Kurse/Renditen (asset_daily_return)' AS source, MAX(return_date) AS max_date
@@ -127,12 +151,26 @@ def _check_pipeline_freshness() -> tuple[str, list[dict]]:
         """
     )
     max_overall = df["max_date"].max()
+    today_lag_days = (date.today() - max_overall).days if max_overall is not None else None
+    expected = _last_expected_business_day(date.today())
+    business_lag_days = (expected - max_overall).days if max_overall is not None else None
     df["lag_days"] = df["max_date"].apply(lambda d: (max_overall - d).days if d is not None else None)
-    status = "ERROR" if df["lag_days"].apply(lambda x: x is None or x > FRESHNESS_LAG_TOLERANCE_DAYS).any() else "OK"
+    relative_bad = df["lag_days"].apply(lambda x: x is None or x > FRESHNESS_LAG_TOLERANCE_DAYS).any()
+    if relative_bad or business_lag_days is None or business_lag_days > 1:
+        status = "ERROR"
+    elif business_lag_days == 1:
+        status = "WARN"
+    else:
+        status = "OK"
     rows = [
         {"Quelle": r["source"], "Letzter Stand": r["max_date"], "Rueckstand": f"{int(r['lag_days'])} Tage" if r["lag_days"] else "aktuell"}
         for r in df.to_dict("records")
     ]
+    rows.append({
+        "Quelle": "Gesamter Stack vs. heute",
+        "Letzter Stand": max_overall,
+        "Rueckstand": f"{today_lag_days} Tage" if today_lag_days else "aktuell",
+    })
     return status, rows
 
 
