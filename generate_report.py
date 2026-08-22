@@ -64,6 +64,36 @@ BENCHMARK_SECONDARY = {
     "weights": {"MSCI_WORLD": 0.6, "GLOBAL_AGG_BOND_H": 0.4},
 }
 
+# Stueckzahl je (Depot, ISIN) wird aus dem Transaktionsledger abgeleitet statt aus dem
+# manuell importierten position_snapshot. position_snapshot wird nur noch monatlich
+# aktualisiert; bei Depots mit haeufigen Trades (Scalable, Trade Republic) lief der Report
+# dadurch der tatsaechlichen (transaktionsbasierten) DB-Wahrheit hinterher. Der Ledger deckt
+# bei allen vier Depots die volle Historie ab (verifiziert gegen verify_transactions_vs_snapshot.py).
+QUANTITY_MOVING_TYPES = (
+    "BUY", "SELL", "DRIP", "FREE_RECEIPT", "TRANSFER_SECURITY_IN", "TRANSFER_SECURITY_OUT",
+)
+# Depots, die dieser Report umfasst - wie bisher (nie via position_snapshot befuellt).
+# Christian Oskar VL (account_id 5) hat inzwischen einen Ledger, war aber nie Teil dieses
+# Reports; bleibt bewusst aussen vor, um den Report-Umfang nicht stillschweigend zu aendern.
+REPORTED_ACCOUNT_IDS = (1, 2, 3, 4)
+
+_TXN_TYPES_SQL = ", ".join(repr(t) for t in QUANTITY_MOVING_TYPES)
+_ACCOUNT_IDS_SQL = ", ".join(str(i) for i in REPORTED_ACCOUNT_IDS)
+
+# Aktueller Bestand je (Depot, ISIN) zum Stichtag :ref, aus dem Ledger kumuliert.
+# Ersetzt die bisherige "DISTINCT ON (account_id, isin) ... FROM portfolio.position_snapshot"-
+# CTE 1:1 (gleiche Spalten: account_id, isin, quantity).
+POSITIONS_AS_OF_CTE = f"""
+    SELECT account_id, isin, SUM(quantity) AS quantity
+    FROM portfolio.transaction
+    WHERE txn_date <= :ref
+      AND isin IS NOT NULL
+      AND txn_type IN ({_TXN_TYPES_SQL})
+      AND account_id IN ({_ACCOUNT_IDS_SQL})
+    GROUP BY account_id, isin
+    HAVING SUM(quantity) > 0.0001
+"""
+
 
 # ── Hilfsfunktionen ───────────────────────────────────────────────────────────
 
@@ -84,15 +114,9 @@ def _b64_png(fig) -> str:
 # ── Datenbankabfragen ─────────────────────────────────────────────────────────
 
 def get_depot_breakdown(ref_date: date) -> pd.DataFrame:
-    """Wert je Depot und ETF, as-of ref_date."""
-    return db_utils.query_df("""
-        WITH snap AS (
-            SELECT DISTINCT ON (account_id, isin)
-                account_id, isin, quantity, as_of_date
-            FROM portfolio.position_snapshot
-            WHERE as_of_date <= :ref
-            ORDER BY account_id, isin, as_of_date DESC
-        ),
+    """Wert je Depot und ETF, as-of ref_date (Stueckzahl aus dem Transaktionsledger)."""
+    return db_utils.query_df(f"""
+        WITH snap AS ({POSITIONS_AS_OF_CTE}),
         price AS (
             SELECT DISTINCT ON (isin)
                 isin, close, price_date
@@ -118,14 +142,8 @@ def get_depot_breakdown(ref_date: date) -> pd.DataFrame:
 
 def get_top_holdings(ref_date: date, n: int = 30) -> pd.DataFrame:
     """Top-N Einzeltitel nach effektivem EUR-Engagement (Look-Through)."""
-    return db_utils.query_df("""
-        WITH snap AS (
-            SELECT DISTINCT ON (account_id, isin)
-                isin, quantity
-            FROM portfolio.position_snapshot
-            WHERE as_of_date <= :ref
-            ORDER BY account_id, isin, as_of_date DESC
-        ),
+    return db_utils.query_df(f"""
+        WITH snap AS ({POSITIONS_AS_OF_CTE}),
         etf_val AS (
             SELECT s.isin AS etf_isin,
                    SUM(s.quantity * p.close) AS etf_eur
@@ -164,12 +182,8 @@ def get_top_holdings(ref_date: date, n: int = 30) -> pd.DataFrame:
 
 def get_sector_allocation(ref_date: date) -> pd.DataFrame:
     """Sektor-Allokation auf Look-Through-Basis."""
-    return db_utils.query_df("""
-        WITH snap AS (
-            SELECT DISTINCT ON (account_id, isin) isin, quantity
-            FROM portfolio.position_snapshot
-            WHERE as_of_date <= :ref ORDER BY account_id, isin, as_of_date DESC
-        ),
+    return db_utils.query_df(f"""
+        WITH snap AS ({POSITIONS_AS_OF_CTE}),
         etf_val AS (
             SELECT s.isin AS etf_isin, SUM(s.quantity * p.close) AS etf_eur
             FROM snap s
@@ -199,12 +213,8 @@ def get_sector_allocation(ref_date: date) -> pd.DataFrame:
 
 def get_country_allocation(ref_date: date) -> pd.DataFrame:
     """Länder-Allokation (Top-15) auf Look-Through-Basis."""
-    return db_utils.query_df("""
-        WITH snap AS (
-            SELECT DISTINCT ON (account_id, isin) isin, quantity
-            FROM portfolio.position_snapshot
-            WHERE as_of_date <= :ref ORDER BY account_id, isin, as_of_date DESC
-        ),
+    return db_utils.query_df(f"""
+        WITH snap AS ({POSITIONS_AS_OF_CTE}),
         etf_val AS (
             SELECT s.isin AS etf_isin, SUM(s.quantity * p.close) AS etf_eur
             FROM snap s
@@ -235,7 +245,7 @@ def get_country_allocation(ref_date: date) -> pd.DataFrame:
 
 def get_etf_overlap(ref_date: date) -> pd.DataFrame:
     """Paarweise ETF-Überlappung: min(wA, wB) für gemeinsame Konstituenten, inkl. Depot."""
-    return db_utils.query_df("""
+    return db_utils.query_df(f"""
         WITH holdings AS (
             SELECT DISTINCT ON (etf_isin, constituent_isin)
                 etf_isin, constituent_isin, weight_pct
@@ -243,7 +253,7 @@ def get_etf_overlap(ref_date: date) -> pd.DataFrame:
             ORDER BY etf_isin, constituent_isin, as_of_date DESC
         ),
         etf_depots AS (
-            -- Letzter Snapshot pro Depot+ETF → Depot-Namen pro ETF aggregieren
+            -- Aktueller Bestand pro Depot+ETF (Ledger) → Depot-Namen pro ETF aggregieren
             SELECT
                 ps.isin,
                 string_agg(DISTINCT
@@ -263,12 +273,7 @@ def get_etf_overlap(ref_date: date) -> pd.DataFrame:
                         ELSE a.name
                     END
                 ) AS depots
-            FROM (
-                SELECT DISTINCT ON (account_id, isin) account_id, isin
-                FROM portfolio.position_snapshot
-                WHERE as_of_date <= :ref
-                ORDER BY account_id, isin, as_of_date DESC
-            ) ps
+            FROM ({POSITIONS_AS_OF_CTE}) ps
             JOIN portfolio.account a ON a.account_id = ps.account_id
             GROUP BY ps.isin
         )
@@ -295,12 +300,8 @@ def get_etf_overlap(ref_date: date) -> pd.DataFrame:
 
 def get_coverage(ref_date: date) -> dict:
     """Abdeckungsquote: welcher Portfoliowert ist Look-Through aufgelöst."""
-    df = db_utils.query_df("""
-        WITH snap AS (
-            SELECT DISTINCT ON (account_id, isin) isin, quantity
-            FROM portfolio.position_snapshot
-            WHERE as_of_date <= :ref ORDER BY account_id, isin, as_of_date DESC
-        ),
+    df = db_utils.query_df(f"""
+        WITH snap AS ({POSITIONS_AS_OF_CTE}),
         etf_val AS (
             SELECT s.isin AS etf_isin, SUM(s.quantity * p.close) AS etf_eur
             FROM snap s
@@ -336,7 +337,7 @@ def get_coverage(ref_date: date) -> dict:
 def get_portfolio_timeseries(
     ref_date: date, start_date: date, filter_start: bool = True
 ) -> pd.DataFrame:
-    """Täglicher Portfoliowert über konstante Stückzahlen (letzter Snapshot).
+    """Täglicher Portfoliowert über konstante Stückzahlen (aktueller Ledger-Stand, Stichtag ref_date).
 
     Pivot + Forward-Fill pro ETF → Feiertage werden mit dem letzten Kurs fortgeschrieben.
 
@@ -344,13 +345,8 @@ def get_portfolio_timeseries(
     Verhindert Wertsprünge wenn neue ETFs erst im Laufe des Zeitraums Kurshistorie bekommen
     (z.B. SCWX nach Markteinführung). Macht den Chart vergleichbar mit dem Benchmark.
     """
-    price_df = db_utils.query_df("""
-        WITH snap AS (
-            SELECT DISTINCT ON (account_id, isin) isin, quantity
-            FROM portfolio.position_snapshot
-            WHERE as_of_date <= :ref
-            ORDER BY account_id, isin, as_of_date DESC
-        ),
+    price_df = db_utils.query_df(f"""
+        WITH snap AS ({POSITIONS_AS_OF_CTE}),
         totals AS (SELECT isin, SUM(quantity) AS qty FROM snap GROUP BY isin)
         SELECT p.price_date, p.isin, p.close::float AS close, p.currency, t.qty::float AS qty
         FROM portfolio.price p
@@ -430,28 +426,39 @@ def get_portfolio_market_value_actual(ref_date: date) -> pd.DataFrame:
     """Täglicher Portfoliowert mit den historisch tatsächlichen Stückzahlen.
 
     Anders als get_portfolio_timeseries() (konstante aktuelle Stückzahl rückwirkend
-    angewendet) wird hier pro Kurstag je (Depot, ETF) der jüngste Snapshot ≤ diesem
-    Tag verwendet — As-of-Join wie in CLAUDE.md Abschnitt 6 beschrieben. Käufe/Verkäufe
-    zwischen zwei Snapshots erscheinen als Stufe im Chart, nicht als Kursbewegung getarnt.
+    angewendet) wird hier pro Kurstag je (Depot, ETF) die aus dem Transaktionsledger
+    kumulierte Stückzahl per diesem Tag verwendet. Jede Transaktion erzeugt eine Stufe
+    im Chart (nicht nur monatliche Snapshot-Termine wie zuvor), Käufe/Verkäufe erscheinen
+    also weiterhin als Stufe, nicht als Kursbewegung getarnt.
 
-    Beginnt am ältesten vorhandenen position_snapshot.as_of_date — davor ist die
-    tatsächliche Zusammensetzung unbekannt. Der Startpunkt wandert mit jedem neuen
-    monatlichen Snapshot nicht weiter zurück (Historie wächst nur nach vorn).
+    Beginnt am ältesten Transaktionsdatum im Ledger — davor ist die tatsächliche
+    Zusammensetzung unbekannt. Der Startpunkt wandert nicht weiter zurück als die
+    Ledger-Historie selbst reicht.
     """
     bounds = db_utils.query_df(
-        "SELECT MIN(as_of_date) AS start_date FROM portfolio.position_snapshot WHERE as_of_date <= :ref",
+        f"""SELECT MIN(txn_date) AS start_date FROM portfolio.transaction
+            WHERE txn_date <= :ref AND isin IS NOT NULL
+              AND txn_type IN ({_TXN_TYPES_SQL}) AND account_id IN ({_ACCOUNT_IDS_SQL})""",
         params={"ref": ref_date},
     )
     start_date = bounds["start_date"].iloc[0]
     if pd.isna(start_date):
         return pd.DataFrame(columns=["date", "portfolio_eur"])
 
-    snap_df = db_utils.query_df("""
-        SELECT account_id, isin, as_of_date, quantity::float AS quantity
-        FROM portfolio.position_snapshot
-        WHERE as_of_date <= :ref
-        ORDER BY account_id, isin, as_of_date
+    snap_df = db_utils.query_df(f"""
+        SELECT account_id, isin, txn_date AS as_of_date, quantity::float AS quantity
+        FROM portfolio.transaction
+        WHERE txn_date <= :ref AND isin IS NOT NULL
+          AND txn_type IN ({_TXN_TYPES_SQL}) AND account_id IN ({_ACCOUNT_IDS_SQL})
+        ORDER BY account_id, isin, txn_date
     """, params={"ref": ref_date})
+
+    # transaction.quantity ist eine signierte Delta-Groesse (+ Zugang, - Abgang), keine
+    # absolute Bestandsangabe wie zuvor position_snapshot.quantity — deshalb je (Depot, ETF)
+    # kumulieren, um den tatsaechlichen Bestand nach jeder Transaktion zu erhalten.
+    if not snap_df.empty:
+        snap_df = snap_df.sort_values(["account_id", "isin", "as_of_date"])
+        snap_df["quantity"] = snap_df.groupby(["account_id", "isin"])["quantity"].cumsum()
 
     price_df = db_utils.query_df("""
         SELECT price_date, isin, close::float AS close, currency
@@ -666,11 +673,55 @@ def get_twr_account_summary() -> pd.DataFrame:
     """)
 
 
+def _benchmark_stats_for_window(code: str, start_date, end_date) -> dict:
+    """Rendite p.a., Vola p.a. und Max Drawdown eines Benchmarks über ein
+    bestimmtes Zeitfenster - für den periodengematchten Vergleich (siehe
+    get_portfolio_efficiency()-Docstring: eine Benchmark-Kennzahl über eine
+    LÄNGERE Historie als das jeweilige Depot wäre nicht fair vergleichbar)."""
+    bidx = get_benchmark_index_from_intelligence(code, start_date, end_date)
+    if bidx.empty or len(bidx) < 2:
+        return {}
+    prices = bidx.set_index("date")["benchmark"].astype(float)
+    daily_ret = prices.pct_change().dropna()
+    n_obs = len(daily_ret)
+    if n_obs == 0:
+        return {}
+    cum_return_pct = (prices.iloc[-1] / prices.iloc[0] - 1) * 100
+    return_pa_pct = (pow(1 + cum_return_pct / 100.0, 252.0 / n_obs) - 1) * 100
+    vol_pa_pct = float(daily_ret.std()) * (252 ** 0.5) * 100
+    running_max = prices.cummax()
+    drawdown = (prices - running_max) / running_max
+    return {
+        "return_pa_pct": return_pa_pct,
+        "vol_pa_pct": vol_pa_pct,
+        "max_drawdown_pct": float(drawdown.min()) * 100,
+    }
+
+
 def get_portfolio_efficiency() -> pd.DataFrame:
-    """Rendite p.a. (geometrisch annualisiert aus der TWR) und Vola p.a.
-    (Stdabw. der taeglichen TWR-Teilperiodenrenditen x sqrt(252)) je Depot
-    und Gesamt - 'Effizienz' der Portfolien, Nutzerwunsch 2026-08-17."""
-    return db_utils.query_df("""
+    """Rendite p.a. (geometrisch annualisiert aus der TWR), Vola p.a.
+    (Stdabw. der taeglichen TWR-Teilperiodenrenditen x sqrt(252)) und
+    Maximum Drawdown je Depot und Gesamt - 'Effizienz' der Portfolien,
+    Nutzerwunsch 2026-08-17, MDD ergaenzt 2026-08-18.
+
+    WICHTIG (2026-08-18, Nutzer-Einwand): twr_daily/twr_daily_total laufen
+    ueber den KOMPLETTEN Kurskalender seit 2018-01-02 (jedes Depot bekommt
+    eine Zeile fuer jeden Handelstag, auch vor seiner eigenen Eroeffnung -
+    siehe phase12_transaction_twr.py::materialize_transaction_position_daily(),
+    account_isin_cal = CROSS JOIN aus je gehandelten ISINs mit dem VOLLEN
+    Kurskalender). Vor der ersten echten Transaktion ist der NAV 0, also
+    subperiod_return_pct NULL (nicht 0!) - der naive MIN(valuation_date)
+    haette daher faelschlich 2018-01-02 als "Start" jedes Depots gezeigt,
+    obwohl z.B. Scalable real erst am 2020-10-14 eroeffnet wurde. n_obs
+    (COUNT(subperiod_return_pct), zaehlt NULLs nicht mit) und cum_return_pct
+    waren dadurch NICHT verfaelscht, aber der ANGEZEIGTE Zeitraum war es -
+    und ein Benchmark-Vergleich ueber "seit 2018" waere fuer ein Depot, das
+    z.B. die COVID-Krise 2020 mangels Existenz gar nicht erlebt hat, unfair
+    (das Depot saehe dann kuenstlich "risikoaermer" aus als der Vergleichs-
+    index). Fix: start_date = erster Tag MIT echtem (nicht-NULL) Return;
+    Benchmark-MDD/-Rendite wird JE ZEILE ueber genau dasselbe (kuerzere,
+    reale) Zeitfenster berechnet, nicht ueber ein gemeinsames globales."""
+    df = db_utils.query_df("""
         WITH per_account AS (
             SELECT av.account_name AS name, td.valuation_date, td.subperiod_return_pct, td.cumulative_twr_pct
             FROM portfolio_intelligence.twr_daily td
@@ -688,7 +739,7 @@ def get_portfolio_efficiency() -> pd.DataFrame:
         agg AS (
             SELECT
                 name,
-                MIN(valuation_date) AS start_date,
+                MIN(valuation_date) FILTER (WHERE subperiod_return_pct IS NOT NULL) AS start_date,
                 MAX(valuation_date) AS end_date,
                 COUNT(subperiod_return_pct) AS n_obs,
                 STDDEV_SAMP(subperiod_return_pct) AS daily_vol_pct,
@@ -701,8 +752,55 @@ def get_portfolio_efficiency() -> pd.DataFrame:
             ((POWER(1 + cum_return_pct / 100.0, 252.0 / NULLIF(n_obs, 0)) - 1) * 100)::float AS return_pa_pct,
             (daily_vol_pct * SQRT(252))::float AS vol_pa_pct
         FROM agg
+        WHERE start_date IS NOT NULL
         ORDER BY CASE WHEN name = 'Gesamtportfolio' THEN 0 ELSE 1 END, name
     """)
+    if df.empty:
+        return df
+
+    # Maximum Drawdown je Serie, NUR ab dem echten Start (siehe Docstring) -
+    # braucht die volle Tages-Zeitreihe, daher separate Query + Berechnung
+    # in pandas statt in SQL.
+    series_df = db_utils.query_df("""
+        SELECT av.account_name AS name, td.valuation_date, td.cumulative_twr_pct::float AS cumulative_twr_pct
+        FROM portfolio_intelligence.twr_daily td
+        JOIN portfolio_intelligence.account_view av ON av.account_view_id = td.account_view_id
+        UNION ALL
+        SELECT 'Gesamtportfolio' AS name, tdt.valuation_date, tdt.cumulative_twr_pct::float AS cumulative_twr_pct
+        FROM portfolio_intelligence.twr_daily_total tdt
+        ORDER BY name, valuation_date
+    """)
+    start_by_name = df.set_index("name")["start_date"]
+    mdd_by_name = {}
+    for name, grp in series_df.groupby("name"):
+        real_start = start_by_name.get(name)
+        if real_start is None:
+            continue
+        g = grp[grp["valuation_date"] >= real_start].sort_values("valuation_date")
+        if g.empty:
+            continue
+        idx = 1 + g["cumulative_twr_pct"] / 100.0  # Wertindex, Start = 1
+        running_max = idx.cummax()
+        drawdown = (idx - running_max) / running_max
+        mdd_by_name[name] = float(drawdown.min()) * 100  # negativ, in %
+    df["max_drawdown_pct"] = df["name"].map(mdd_by_name)
+
+    # Benchmark-Vergleich JE ZEILE über exakt dasselbe (reale) Zeitfenster -
+    # siehe Docstring, das ist der eigentliche Fix ggü. der 2026-08-18-
+    # Erstversion (die fälschlich ein gemeinsames "seit 2018"-Fenster nutzte).
+    msci_mdd, msci_ret, blend_mdd, blend_ret = [], [], [], []
+    for _, r in df.iterrows():
+        m = _benchmark_stats_for_window("MSCI_WORLD", r["start_date"], r["end_date"])
+        b = _benchmark_stats_for_window("60_40_EQUITY_CREDIT", r["start_date"], r["end_date"])
+        msci_mdd.append(m.get("max_drawdown_pct"))
+        msci_ret.append(m.get("return_pa_pct"))
+        blend_mdd.append(b.get("max_drawdown_pct"))
+        blend_ret.append(b.get("return_pa_pct"))
+    df["benchmark_msci_mdd_pct"] = msci_mdd
+    df["benchmark_msci_return_pa_pct"] = msci_ret
+    df["benchmark_6040_mdd_pct"] = blend_mdd
+    df["benchmark_6040_return_pa_pct"] = blend_ret
+    return df
 
 
 def get_te_table() -> pd.DataFrame:
@@ -769,6 +867,68 @@ def get_mctr_top(benchmark_code: str = "MSCI_WORLD", window_days: int = 60, n: i
         ORDER BY ABS(m.pct_of_total_te) DESC
         LIMIT :n
     """, params={"code": benchmark_code, "wd": window_days, "n": n})
+
+
+def get_normrt_total() -> pd.DataFrame:
+    """Normierte aktive Rendite (NormRt_Real, Fachkonzept Abschnitt 5.3.3,
+    Phase 16) auf Gesamtportfolio-Ebene, 1-Jahres-Fenster, je Benchmark -
+    direkt aus der Dashboard-View (2026-08-18 neu)."""
+    return db_utils.query_df("""
+        SELECT benchmark_code, norm_return_real_pct
+        FROM portfolio_intelligence.v_dashboard_normrt_total
+        ORDER BY benchmark_code
+    """)
+
+
+def get_te_utilization_portfolio() -> pd.DataFrame:
+    """TE-Auslastung Gesamtportfolio gegen die vom Nutzer vorgegebenen, festen
+    Portfolio-Level-TE-Limits (5 % ggue. 60/40-Blend, 8 % ggue. MSCI World,
+    2026-08-18) - eigene Limits, nicht die mandatsscharfen aus Phase 11."""
+    return db_utils.query_df("""
+        SELECT benchmark_code, tracking_error_pct, te_limit_pct, utilization_pct
+        FROM portfolio_intelligence.v_dashboard_te_utilization_total
+        ORDER BY benchmark_code
+    """)
+
+
+def get_regime_switch() -> pd.DataFrame:
+    """Regime-Switch-Erkennung je Benchmark (Fachkonzept-Formel Vol_20d >
+    1,65 x Vol_5y, Phase 18), neuester Tag - nur die beiden TE-Ziel-
+    Benchmarks, reine Erkennung ohne automatische Ampel (Fachkonzept-Vorgabe)."""
+    return db_utils.query_df("""
+        SELECT benchmark_code, vol_20d_pct_pa, vol_5y_pct_pa, is_stress
+        FROM portfolio_intelligence.v_dashboard_regime_switch
+        WHERE benchmark_code IN ('MSCI_WORLD', '60_40_EQUITY_CREDIT')
+        ORDER BY benchmark_code
+    """)
+
+
+def get_diversification() -> pd.DataFrame:
+    """Diversifikationsindikator (Phase 19, Nutzer-Formel: gewichtete
+    durchschnittliche paarweise Korrelation), Basis rohe Asset-Renditen,
+    alle Fenster."""
+    return db_utils.query_df("""
+        SELECT window_days, diversification_indicator, n_assets
+        FROM portfolio_intelligence.v_dashboard_diversification
+        WHERE basis = 'asset_return'
+        ORDER BY window_days
+    """)
+
+
+def get_correlation_extremes(window_days: int = 252, n: int = 5) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Hoechst- und niedrigst-korrelierte Mandats-Paare (Phase 19, Basis rohe
+    Renditen) - kompakte Tabellen-Alternative zur vollen Heatmap aus dem
+    Dashboard, die sich nicht sinnvoll in eine E-Mail einbetten laesst."""
+    df = db_utils.query_df("""
+        SELECT ticker_1, ticker_2, correlation
+        FROM portfolio_intelligence.v_dashboard_correlation_matrix
+        WHERE window_days = :wd
+    """, params={"wd": window_days})
+    if df.empty:
+        return df, df
+    top = df.sort_values("correlation", ascending=False).head(n)
+    bottom = df.sort_values("correlation", ascending=True).head(n)
+    return top, bottom
 
 
 def _ts_at_or_before(ts: pd.Series, target: date) -> float | None:
@@ -1106,16 +1266,30 @@ def html_performance_table(
 def html_efficiency_table(df: pd.DataFrame) -> str:
     if df.empty:
         return "<p style='color:#94A3B8;font-size:13px'>Keine TWR-Daten verfügbar.</p>"
-    rows = _tbl_row("Depot", "Zeitraum", "Rendite p.a.", "Vola p.a.", "Rendite/Vola", header=True)
+    rows = _tbl_row("Depot", "Zeitraum (real)", "Rendite p.a.", "Vola p.a.", "Rendite/Vola",
+                     "Max Drawdown", "Calmar Ratio", "Bench.-MDD MSCI/60-40 (gleicher Zeitraum)", header=True)
     for _, r in df.iterrows():
         ratio = r["return_pa_pct"] / r["vol_pa_pct"] if r["vol_pa_pct"] else None
+        mdd = r.get("max_drawdown_pct")
+        calmar = r["return_pa_pct"] / abs(mdd) if pd.notna(mdd) and mdd != 0 else None
         name_cell = f"<strong>{r['name']}</strong>" if r["name"] == "Gesamtportfolio" else r["name"]
+
+        msci_mdd = r.get("benchmark_msci_mdd_pct")
+        blend_mdd = r.get("benchmark_6040_mdd_pct")
+        bench_cell = (
+            f"{msci_mdd:.1f} % / {blend_mdd:.1f} %"
+            if pd.notna(msci_mdd) and pd.notna(blend_mdd) else "–"
+        )
+
         rows += _tbl_row(
             name_cell,
             f"{r['start_date'].strftime('%d.%m.%y')}–{r['end_date'].strftime('%d.%m.%y')}",
             f"{'+' if r['return_pa_pct'] >= 0 else ''}{r['return_pa_pct']:.1f} %",
             f"{r['vol_pa_pct']:.1f} %",
             f"{ratio:.2f}" if ratio is not None else "–",
+            f"<span style='color:{RED}'>{mdd:.1f} %</span>" if pd.notna(mdd) else "–",
+            f"{calmar:.2f}" if calmar is not None else "–",
+            bench_cell,
         )
     return f'<table class="data-tbl">\n{rows}</table>'
 
@@ -1175,6 +1349,87 @@ def html_mctr_table(df: pd.DataFrame) -> str:
     return f'<table class="data-tbl">\n{rows}</table>'
 
 
+def html_te_utilization_table(df: pd.DataFrame) -> str:
+    if df.empty:
+        return "<p style='color:#94A3B8;font-size:13px'>Keine Daten verfügbar.</p>"
+    rows = _tbl_row("Benchmark", "TE (252 Tage)", "Limit", "Auslastung", header=True)
+    for _, r in df.iterrows():
+        bench = "MSCI World" if r["benchmark_code"] == "MSCI_WORLD" else "60/40-Blend"
+        util = r["utilization_pct"]
+        color = RED if pd.notna(util) and (util < 60 or util > 150) else \
+                GREEN if pd.notna(util) and 80 <= util <= 120 else ORANGE
+        util_cell = (f'<span style="color:{color};font-weight:600">{util:.0f} %</span>'
+                     if pd.notna(util) else "–")
+        rows += _tbl_row(
+            bench,
+            f"{r['tracking_error_pct']:.2f} %" if pd.notna(r["tracking_error_pct"]) else "–",
+            f"{r['te_limit_pct']:.1f} %" if pd.notna(r["te_limit_pct"]) else "–",
+            util_cell,
+        )
+    return f'<table class="data-tbl">\n{rows}</table>'
+
+
+def html_normrt_table(df: pd.DataFrame) -> str:
+    if df.empty:
+        return "<p style='color:#94A3B8;font-size:13px'>Keine NormRt-Daten verfügbar.</p>"
+    rows = _tbl_row("Benchmark", "NormRt (252 Tage)", header=True)
+    for _, r in df.iterrows():
+        bench = "MSCI World" if r["benchmark_code"] == "MSCI_WORLD" else "60/40-Blend"
+        val = r["norm_return_real_pct"]
+        rows += _tbl_row(bench, f"{val:.2f}" if pd.notna(val) else "–")
+    return f'<table class="data-tbl">\n{rows}</table>'
+
+
+def html_regime_switch_table(df: pd.DataFrame) -> str:
+    if df.empty:
+        return "<p style='color:#94A3B8;font-size:13px'>Keine Regime-Switch-Daten verfügbar.</p>"
+    rows = _tbl_row("Benchmark", "Vola 20 Tage p.a.", "Vola 5 Jahre p.a.", "Status", header=True)
+    for _, r in df.iterrows():
+        bench = "MSCI World" if r["benchmark_code"] == "MSCI_WORLD" else "60/40-Blend"
+        is_stress = bool(r["is_stress"]) if pd.notna(r["is_stress"]) else False
+        color = RED if is_stress else GREEN
+        label = "Stressphase" if is_stress else "Normal"
+        dot = (f'<span style="display:inline-block;width:9px;height:9px;border-radius:50%;'
+               f'background:{color};margin-right:6px;vertical-align:middle"></span>')
+        rows += _tbl_row(
+            bench,
+            f"{r['vol_20d_pct_pa']:.1f} %" if pd.notna(r["vol_20d_pct_pa"]) else "–",
+            f"{r['vol_5y_pct_pa']:.1f} %" if pd.notna(r["vol_5y_pct_pa"]) else "–",
+            f"{dot}{label}",
+        )
+    return f'<table class="data-tbl">\n{rows}</table>'
+
+
+def html_diversification_table(df: pd.DataFrame) -> str:
+    if df.empty:
+        return "<p style='color:#94A3B8;font-size:13px'>Keine Diversifikationsdaten verfügbar.</p>"
+    rows = _tbl_row("Fenster", "Diversifikationsindikator", "Mandate", header=True)
+    for _, r in df.iterrows():
+        rows += _tbl_row(
+            f"{int(r['window_days'])} Tage",
+            f"{r['diversification_indicator']:.2f}" if pd.notna(r["diversification_indicator"]) else "–",
+            f"{int(r['n_assets'])}" if pd.notna(r["n_assets"]) else "–",
+        )
+    return f'<table class="data-tbl">\n{rows}</table>'
+
+
+def html_correlation_extremes(top: pd.DataFrame, bottom: pd.DataFrame) -> str:
+    if top.empty and bottom.empty:
+        return "<p style='color:#94A3B8;font-size:13px'>Keine Korrelationsdaten verfügbar.</p>"
+    rows = _tbl_row("Am höchsten korreliert", "Korrelation", "Am niedrigsten korreliert", "Korrelation", header=True)
+    n = max(len(top), len(bottom))
+    for i in range(n):
+        t = top.iloc[i] if i < len(top) else None
+        b = bottom.iloc[i] if i < len(bottom) else None
+        rows += _tbl_row(
+            f"{t['ticker_1']} / {t['ticker_2']}" if t is not None else "",
+            f"{t['correlation']:.2f}" if t is not None else "",
+            f"{b['ticker_1']} / {b['ticker_2']}" if b is not None else "",
+            f"{b['correlation']:.2f}" if b is not None else "",
+        )
+    return f'<table class="data-tbl">\n{rows}</table>'
+
+
 # ── Vollständiger HTML-Report ─────────────────────────────────────────────────
 
 CSS = """
@@ -1227,7 +1482,11 @@ def generate_html(ref_date: date) -> str:
     Depot-Pie/-Tabelle ist raus (Funktion bleibt im Modul erhalten, falls
     später wieder gebraucht). Neu: echte TWR-Performance vs. Benchmarks und
     ein Fachkonzept-Kennzahlen-Abschnitt (TE, TE-Limit-Ampel, MCTR) - siehe
-    "TWR & Fachkonzept-Kennzahlen" weiter oben im Modul."""
+    "TWR & Fachkonzept-Kennzahlen" weiter oben im Modul.
+    2026-08-18: Risikokennzahlen-Abschnitt um TE-Auslastung Gesamtportfolio
+    (feste 5%/8%-Limits), NormRt, Regime-Switch-Erkennung und
+    Diversifikationsindikator/Korrelations-Extreme erweitert - Pendant zu den
+    gleichnamigen neuen Dashboard-Kacheln/-Tabs in trading-dashboard."""
     log.info("Lade Daten für %s …", ref_date)
 
     df_depot   = get_depot_breakdown(ref_date)
@@ -1258,10 +1517,15 @@ def generate_html(ref_date: date) -> str:
     twr_by_depot   = dict(zip(df_twr_accounts["account_name"], df_twr_accounts["cumulative_twr_pct"]))
     df_efficiency  = get_portfolio_efficiency()
 
-    log.info("Lade Fachkonzept-Kennzahlen (TE, Ampel, MCTR) …")
+    log.info("Lade Fachkonzept-Kennzahlen (TE, Ampel, MCTR, NormRt, Regime-Switch, Diversifikation) …")
     df_te    = get_te_table()
     df_ampel = get_mandate_ampel_table()
     df_mctr  = get_mctr_top()
+    df_te_util_total = get_te_utilization_portfolio()
+    df_normrt         = get_normrt_total()
+    df_regime         = get_regime_switch()
+    df_diversification = get_diversification()
+    df_corr_top, df_corr_bottom = get_correlation_extremes()
 
     # Depot-KPIs: EUR-Wert (Snapshot) + echte kumulierte TWR nebeneinander
     depot_summen = df_depot.groupby("depot")["wert_eur"].sum().sort_values(ascending=False)
@@ -1338,9 +1602,17 @@ echte Rendite, nicht die reine Vermögensentwicklung.
 <h2>Effizienz der Portfolien</h2>
 <p style="color:#64748B;font-size:13px;margin-bottom:12px;">
 Annualisierte Rendite (geometrisch aus der TWR) und annualisierte Volatilität
-(Stdabw. der täglichen TWR-Teilperiodenrenditen) je Depot und Gesamt.
-Rendite/Vola als grobes Effizienzmaß (kein Sharpe Ratio – kein risikofreier
-Zins abgezogen).
+(Stdabw. der täglichen TWR-Teilperiodenrenditen) je Depot und Gesamt, ab dem
+jeweils <strong>echten</strong> Eröffnungsdatum (nicht "seit 2018" für alle –
+die Depots wurden zu unterschiedlichen Zeitpunkten eröffnet, siehe Spalte
+"Zeitraum"). Rendite/Vola als grobes Effizienzmaß (kein Sharpe Ratio – kein
+risikofreier Zins abgezogen). Max Drawdown: größter Peak-to-Trough-Verlust
+auf dem kumulierten TWR-Index. Calmar Ratio: Rendite p.a. / |Max Drawdown| –
+setzt Rendite ins Verhältnis zum größten tatsächlich erlittenen Verlust
+statt zur Volatilität. Letzte Spalte: was MSCI World bzw. der 60/40-Blend
+über <strong>exakt denselben (realen) Zeitraum</strong> als Max Drawdown
+gezeigt hätten – ein längeres Benchmark-Fenster wäre unfair, weil z. B. ein
+2021 eröffnetes Depot die Corona-Krise 2020 gar nicht miterlebt hat.
 </p>
 <div class="section">
 {html_efficiency_table(df_efficiency)}
@@ -1375,6 +1647,42 @@ TE-Limit-Auslastung je Mandat und die größten Risikobeiträge zum Gesamtportfo
 <div class="section">
 <h3>Größte Risikobeiträge (MCTR, 60 Tage, ggü. MSCI World)</h3>
 {html_mctr_table(df_mctr)}
+</div>
+<div class="section">
+<h3>TE-Auslastung Gesamtportfolio (252 Tage)</h3>
+<p style="color:#64748B;font-size:12px;margin-bottom:8px;">
+Gegen feste Portfolio-Level-Limits (5 % ggü. 60/40-Blend, 8 % ggü. MSCI World) –
+eigene Limits, nicht die mandatsscharfen Excel-Limits aus der Tabelle oben.
+</p>
+{html_te_utilization_table(df_te_util_total)}
+</div>
+<div class="section">
+<h3>Normierte aktive Rendite (NormRt, 252 Tage)</h3>
+<p style="color:#64748B;font-size:12px;margin-bottom:8px;">
+Normiert die aktive Rendite auf das eingegangene Risiko (Fachkonzept Abschnitt 5.3.3) –
+macht Perioden mit unterschiedlicher Tracking Error vergleichbar.
+</p>
+{html_normrt_table(df_normrt)}
+</div>
+<div class="section">
+<h3>Regime-Switch-Erkennung</h3>
+<p style="color:#64748B;font-size:12px;margin-bottom:8px;">
+Stressphase: 20-Tage-Volatilität &gt; 1,65 × 5-Jahres-Volatilität des Benchmarks
+(Fachkonzept-Formel). Reine Erkennung – in Stressphasen bewusst keine automatische
+Ampel-Übersteuerung, sondern qualitative Einschätzung durch das Portfoliomanagement.
+</p>
+{html_regime_switch_table(df_regime)}
+</div>
+<div class="section">
+<h3>Diversifikationsindikator</h3>
+<p style="color:#64748B;font-size:12px;margin-bottom:8px;">
+Gewichtete durchschnittliche paarweise Korrelation der gehaltenen Mandate (Basis: rohe
+Asset-Renditen). Je näher an 1, desto geringer der Diversifikationsnutzen – steigt
+typischerweise in Marktstress.
+</p>
+{html_diversification_table(df_diversification)}
+<h3 style="margin-top:18px;">Korrelations-Extreme (252 Tage)</h3>
+{html_correlation_extremes(df_corr_top, df_corr_bottom)}
 </div>
 
 <!-- ── Look-Through ── -->
